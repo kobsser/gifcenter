@@ -85,14 +85,27 @@ db.execute(
     "CREATE TABLE IF NOT EXISTS sent ("
     "file_unique_id TEXT, dest_file_id TEXT, dest INTEGER NOT NULL, sent_at TEXT NOT NULL)"
 )
-# Migrate the old schema without trusting its file_id values: those rows used the
-# source chat file_id, which is not the destination file_id we need for reuse.
-columns = {row[1] for row in db.execute("PRAGMA table_info(sent)")}
-if "file_unique_id" not in columns:
+# Migrate the old schema. Older versions had a NOT NULL `file_id` column,
+# which cannot accept the new INSERT shape. Those old file_id values were the
+# source file IDs, not destination file IDs, so they are intentionally discarded.
+columns_info = list(db.execute("PRAGMA table_info(sent)"))
+columns = {row[1]: row for row in columns_info}
+if "file_id" in columns:
+    db.execute("DROP INDEX IF EXISTS sent_ix")
+    db.execute("DROP TABLE IF EXISTS sent_new")
+    db.execute(
+        "CREATE TABLE sent_new ("
+        "file_unique_id TEXT, dest_file_id TEXT, dest INTEGER NOT NULL, "
+        "sent_at TEXT NOT NULL)"
+    )
+    db.execute("DROP TABLE sent")
+    db.execute("ALTER TABLE sent_new RENAME TO sent")
+elif "file_unique_id" not in columns:
     db.execute("ALTER TABLE sent ADD COLUMN file_unique_id TEXT")
 if "dest_file_id" not in columns:
     db.execute("ALTER TABLE sent ADD COLUMN dest_file_id TEXT")
-db.execute("CREATE INDEX IF NOT EXISTS sent_ix ON sent (file_unique_id, dest)")
+db.execute("DROP INDEX IF EXISTS sent_ix")
+db.execute("CREATE INDEX sent_ix ON sent (file_unique_id, dest)")
 db.commit()
 
 # ─────────────────────────── send core ───────────────────────────
