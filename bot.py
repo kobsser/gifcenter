@@ -53,7 +53,11 @@ client = Client(
 
 # ─────────────────────────── state ───────────────────────────
 
-DEFAULT_STATE = {"groups": [], "dest": None, "delay": 2.0, "dedup": True}
+DEFAULT_STATE = {
+    "groups": [], "dest": None, "delay": 2.0, "dedup": True,
+    "keywords": [], "keywords_enabled": False, "keyword_allow_all": False,
+    "keyword_users": [],
+}
 
 
 def load_state() -> dict:
@@ -66,6 +70,8 @@ def load_state() -> dict:
         state.setdefault(key, default)
     state["groups"] = [int(g) for g in state["groups"]]
     state["delay"] = float(state["delay"])
+    state["keywords"] = [str(k).casefold() for k in state["keywords"] if str(k).strip()]
+    state["keyword_users"] = [int(u) for u in state["keyword_users"]]
     return state
 
 
@@ -77,13 +83,20 @@ def save_state(state: dict) -> None:
 
 
 state = load_state()
-send_lock = asyncio.Lock()  # serializes clones from listener + .gc load
+
+# Every GIF send goes through this single queue, regardless of whether it came
+# from the watcher, .gc load, or a keyword trigger. The worker owns the delay,
+# so concurrent message handlers cannot bypass it.
+send_queue: asyncio.Queue | None = None
+send_queue_loop: asyncio.AbstractEventLoop | None = None
+send_worker_task: asyncio.Task | None = None
 
 SENT_DB = DATA_DIR / "sent.db"
 db = sqlite3.connect(str(SENT_DB))
 db.execute(
     "CREATE TABLE IF NOT EXISTS sent ("
-    "file_unique_id TEXT, dest_file_id TEXT, dest INTEGER NOT NULL, sent_at TEXT NOT NULL)"
+    "file_unique_id TEXT, dest_file_id TEXT, dest_file_unique_id TEXT, "
+    "dest INTEGER NOT NULL, sent_at TEXT NOT NULL)"
 )
 # Migrate the old schema. Older versions had a NOT NULL `file_id` column,
 # which cannot accept the new INSERT shape. Those old file_id values were the
@@ -95,17 +108,22 @@ if "file_id" in columns:
     db.execute("DROP TABLE IF EXISTS sent_new")
     db.execute(
         "CREATE TABLE sent_new ("
-        "file_unique_id TEXT, dest_file_id TEXT, dest INTEGER NOT NULL, "
-        "sent_at TEXT NOT NULL)"
+        "file_unique_id TEXT, dest_file_id TEXT, dest_file_unique_id TEXT, "
+        "dest INTEGER NOT NULL, sent_at TEXT NOT NULL)"
     )
     db.execute("DROP TABLE sent")
     db.execute("ALTER TABLE sent_new RENAME TO sent")
+    columns = {row[1]: row for row in db.execute("PRAGMA table_info(sent)")}
 elif "file_unique_id" not in columns:
     db.execute("ALTER TABLE sent ADD COLUMN file_unique_id TEXT")
 if "dest_file_id" not in columns:
     db.execute("ALTER TABLE sent ADD COLUMN dest_file_id TEXT")
+if "dest_file_unique_id" not in columns:
+    db.execute("ALTER TABLE sent ADD COLUMN dest_file_unique_id TEXT")
 db.execute("DROP INDEX IF EXISTS sent_ix")
+db.execute("DROP INDEX IF EXISTS sent_dest_unique_ix")
 db.execute("CREATE INDEX sent_ix ON sent (file_unique_id, dest)")
+db.execute("CREATE INDEX sent_dest_unique_ix ON sent (dest_file_unique_id, dest)")
 db.commit()
 
 # ─────────────────────────── send core ───────────────────────────
@@ -134,7 +152,7 @@ async def send_with_flood_retry(fn: str, *args, tries: int = 5):
     return None
 
 
-async def clone_media(message: Message):
+async def clone_media(message: Message, *, force: bool = False):
     """Clone one GIF message to the destination chat.
 
     file_unique_id identifies the source GIF for deduplication.  The
@@ -152,13 +170,14 @@ async def clone_media(message: Message):
     source_unique_id = anim.file_unique_id
     cached = db.execute(
         "SELECT dest_file_id FROM sent "
-        "WHERE file_unique_id = ? AND dest = ? AND dest_file_id IS NOT NULL "
+        "WHERE (file_unique_id = ? OR dest_file_unique_id = ?) "
+        "AND dest = ? AND dest_file_id IS NOT NULL "
         "ORDER BY rowid DESC LIMIT 1",
-        (source_unique_id, dest),
+        (source_unique_id, source_unique_id, dest),
     ).fetchone()
 
     if cached:
-        if state["dedup"]:
+        if state["dedup"] and not force:
             log.info(
                 "skip %s/%s: gif unique_id=%s already in dest",
                 message.chat.id, message.id, source_unique_id,
@@ -166,9 +185,9 @@ async def clone_media(message: Message):
             return False
 
         log.info(
-            "GIF %s/%s: dedup off — reusing destination file_id=%s "
+            "GIF %s/%s: %s — reusing destination file_id=%s "
             "for unique_id=%s (no re-upload)",
-            message.chat.id, message.id, cached[0], source_unique_id,
+            message.chat.id, message.id, "keyword trigger" if force else "dedup off", cached[0], source_unique_id,
         )
         try:
             return await send_with_flood_retry("send_cached_media", dest, cached[0]) is not None
@@ -223,6 +242,7 @@ async def clone_media(message: Message):
 
     dest_anim = getattr(sent_message, "animation", None)
     dest_file_id = getattr(dest_anim, "file_id", None)
+    dest_unique_id = getattr(dest_anim, "file_unique_id", None)
     if not dest_file_id:
         log.error(
             "GIF %s/%s: send succeeded but destination animation has no file_id; "
@@ -232,24 +252,61 @@ async def clone_media(message: Message):
         return True
 
     db.execute(
-        "INSERT INTO sent (file_unique_id, dest_file_id, dest, sent_at) "
-        "VALUES (?, ?, ?, datetime('now'))",
-        (source_unique_id, dest_file_id, dest),
+        "INSERT INTO sent (file_unique_id, dest_file_id, dest_file_unique_id, dest, sent_at) "
+        "VALUES (?, ?, ?, ?, datetime('now'))",
+        (source_unique_id, dest_file_id, dest_unique_id, dest),
     )
     db.commit()
     log.info(
-        "GIF %s/%s: cached source unique_id=%s -> destination file_id=%s",
-        message.chat.id, message.id, source_unique_id, dest_file_id,
+        "GIF %s/%s: cached source unique_id=%s -> destination file_id=%s, "
+        "destination unique_id=%s",
+        message.chat.id, message.id, source_unique_id, dest_file_id, dest_unique_id,
     )
     return True
 
 
+async def _send_worker(queue: asyncio.Queue) -> None:
+    """Process every GIF send in one FIFO stream and enforce the global delay."""
+    while True:
+        message, force, result = await queue.get()
+        try:
+            ok = await clone_media(message, force=force)
+            if not result.done():
+                result.set_result(ok)
+            if ok:
+                await asyncio.sleep(state["delay"])
+        except Exception as e:
+            log.exception("queued GIF send failed")
+            if not result.done():
+                result.set_exception(e)
+        finally:
+            queue.task_done()
+
+
+def _ensure_send_worker() -> None:
+    global send_queue, send_queue_loop, send_worker_task
+    loop = asyncio.get_running_loop()
+    if send_worker_task is None or send_worker_task.done() or send_queue_loop is not loop:
+        send_queue = asyncio.Queue()
+        send_queue_loop = loop
+        send_worker_task = asyncio.create_task(_send_worker(send_queue))
+
+
+async def _queue_send(message: Message, *, force: bool = False) -> bool:
+    _ensure_send_worker()
+    loop = asyncio.get_running_loop()
+    result = loop.create_future()
+    assert send_queue is not None
+    await send_queue.put((message, force, result))
+    return await result
+
+
 async def send_to_dest(message: Message) -> bool:
-    async with send_lock:
-        ok = await clone_media(message)
-        if ok:
-            await asyncio.sleep(state["delay"])
-        return ok
+    return await _queue_send(message)
+
+
+async def send_to_dest_with_force(message: Message) -> bool:
+    return await _queue_send(message, force=True)
 
 
 # ─────────────────────────── live listener ───────────────────────────
@@ -262,25 +319,54 @@ async def on_group_message(app, message, *a):
         return
     if not message.from_user or message.from_user.is_self:
         return
-    if message.animation is None:
+    if message.animation is not None:
+        log.info("GIF in watched group %s (msg %d) — cloning", message.chat.id, message.id)
+        await send_to_dest(message)
         return
-    log.info("GIF in watched group %s (msg %d) — cloning", message.chat.id, message.id)
-    await send_to_dest(message)
+    if not state["keywords_enabled"] or not message.text:
+        return
+    keyword = message.text.strip().casefold()
+    if keyword not in state["keywords"]:
+        return
+    if not state["keyword_allow_all"] and message.from_user.id not in state["keyword_users"]:
+        log.info("keyword %r ignored for user %s: not whitelisted", keyword, message.from_user.id)
+        return
+    replied = getattr(message, "reply_to_message", None)
+    if replied is None or replied.animation is None:
+        return
+    log.info("keyword %r triggered GIF %s/%s by user %s", keyword, replied.chat.id, replied.id, message.from_user.id)
+    await send_to_dest_with_force(replied)
 
 
 # ─────────────────────────── commands ───────────────────────────
 
 HELP_TEXT = (
-    f"gifcenter commands (prefix {PREFIX!r}, private, owner only):\n"
-    f"{PREFIX}gc add <group_id>      watch a group for GIFs\n"
-    f"{PREFIX}gc remove <group_id>   stop watching a group\n"
-    f"{PREFIX}gc list                watched groups + destination + delay\n"
-    f"{PREFIX}gc dest <chat_id>      where GIFs get cloned (channel or group)\n"
-    f"{PREFIX}gc load <group_id> <n> clone last n messages' GIFs (1–50000)\n"
-    f"{PREFIX}gc delay <seconds>     pause between clones (0.1–3600, default 2)\n"
-    f"{PREFIX}gc dedup [on|off]      skip GIFs already sent to the destination (on/off)\n"
-    f"{PREFIX}gc session             export your session string (for porting)\n"
-    f"{PREFIX}gc help                this text"
+    f"gifcenter — GIF watcher/loader\n"
+    f"All commands are private-chat, owner-only. Prefix: {PREFIX!r}\n\n"
+    f"WATCHING\n"
+    f"  {PREFIX}gc add <group_id>       Start watching a group\n"
+    f"  {PREFIX}gc remove <group_id>    Stop watching a group\n"
+    f"  {PREFIX}gc list                 Show watched groups and settings\n"
+    f"  {PREFIX}gc dest <chat_id>       Set the destination chat\n"
+    f"  {PREFIX}gc load <group_id> <n>  Queue GIFs from the last n messages (1–50000)\n\n"
+    f"SENDING\n"
+    f"  {PREFIX}gc delay <seconds>      Global delay between successful sends (0.1–3600s)\n"
+    f"  {PREFIX}gc dedup [on|off]       Skip GIFs already known in the destination\n"
+    f"  {PREFIX}gc kw ...               Re-send a replied GIF when a keyword is posted\n"
+    f"  {PREFIX}gc session              Export the current session string\n\n"
+    f"KEYWORDS\n"
+    f"  {PREFIX}gc kw add <text>        Add a keyword (exact, case-insensitive match)\n"
+    f"  {PREFIX}gc kw remove <text>     Remove a keyword\n"
+    f"  {PREFIX}gc kw list              List keywords and current access mode\n"
+    f"  {PREFIX}gc kw on|off             Enable/disable keyword triggers\n"
+    f"  {PREFIX}gc kw all on|off         Allow everyone or whitelist only\n"
+    f"  {PREFIX}gc kw user add <id>      Add a user to the keyword whitelist\n"
+    f"  {PREFIX}gc kw user remove <id>   Remove a user from the whitelist\n"
+    f"  {PREFIX}gc kw user list          List whitelisted user IDs\n"
+    f"  {PREFIX}gc kw help               Show keyword command details\n\n"
+    f"NOTES\n"
+    f"  Every GIF send shares one FIFO queue, so delay applies across watcher, load, and keyword sends.\n"
+    f"  Keyword replies reuse a cached destination file when available; they bypass dedup so they can re-send."
 )
 
 
@@ -459,6 +545,78 @@ async def cmd_dedup(args, message) -> str:
     return f"dedup: {v}"
 
 
+async def cmd_kw(args, message) -> str:
+    if len(args) < 2:
+        return ("kw: " + ("on" if state["keywords_enabled"] else "off") +
+                f"; everyone: {'on' if state['keyword_allow_all'] else 'off'}\n"
+                f"keywords: {', '.join(state['keywords']) or '(none)'}\n"
+                f"users: {', '.join(map(str, state['keyword_users'])) or '(none)'}\n"
+                "usage: .gc kw <add|list|remove|on|off|all|user> ...")
+    sub = args[1].casefold()
+    if sub == "help":
+        return (".gc kw add <keyword>\n.gc kw list\n.gc kw remove <keyword>\n"
+                ".gc kw on|off\n.gc kw all on|off\n"
+                ".gc kw user add <user_id>\n.gc kw user remove <user_id>\n.gc kw user list")
+    if sub in ("on", "off"):
+        state["keywords_enabled"] = sub == "on"
+        save_state(state)
+        return f"keywords: {sub}"
+    if sub == "all":
+        if len(args) < 3 or args[2].casefold() not in ("on", "off"):
+            return "usage: .gc kw all <on|off>"
+        state["keyword_allow_all"] = args[2].casefold() == "on"
+        save_state(state)
+        return f"keyword everyone: {args[2].casefold()}"
+    if sub == "add":
+        keyword = " ".join(args[2:]).strip().casefold()
+        if not keyword:
+            return "usage: .gc kw add <keyword>"
+        if keyword in state["keywords"]:
+            return "keyword already exists"
+        state["keywords"].append(keyword)
+        save_state(state)
+        return f"keyword added: {keyword}"
+    if sub == "remove":
+        keyword = " ".join(args[2:]).strip().casefold()
+        if not keyword:
+            return "usage: .gc kw remove <keyword>"
+        if keyword not in state["keywords"]:
+            return "keyword not found"
+        state["keywords"].remove(keyword)
+        save_state(state)
+        return f"keyword removed: {keyword}"
+    if sub == "list":
+        lines = [
+            f"keywords: {'on' if state['keywords_enabled'] else 'off'}",
+            f"everyone: {'on' if state['keyword_allow_all'] else 'off'}",
+        ]
+        lines.extend(f"• {k}" for k in state["keywords"] or ["(none)"])
+        return "\n".join(lines)
+    if sub == "user":
+        if len(args) < 3 or args[2].casefold() not in ("add", "remove", "list"):
+            return "usage: .gc kw user <add|remove|list> [user_id]"
+        action = args[2].casefold()
+        if action == "list":
+            return "\n".join(map(str, state["keyword_users"])) or "(none)"
+        if len(args) < 4:
+            return f"usage: .gc kw user {action} <user_id>"
+        try:
+            uid = int(args[3])
+        except ValueError:
+            return "user_id must be an integer"
+        if action == "add":
+            if uid not in state["keyword_users"]:
+                state["keyword_users"].append(uid)
+                save_state(state)
+            return f"keyword user allowed: {uid}"
+        if uid not in state["keyword_users"]:
+            return "user not found"
+        state["keyword_users"].remove(uid)
+        save_state(state)
+        return f"keyword user removed: {uid}"
+    return "unknown kw subcommand; use .gc kw help"
+
+
 async def cmd_session(args, message) -> str:
     try:
         s = await client.export_session_string()
@@ -491,6 +649,8 @@ async def gc_command(app, message: Message, *a):
             text = await cmd_delay(args, message)
         elif cmd == "dedup":
             text = await cmd_dedup(args, message)
+        elif cmd == "kw":
+            text = await cmd_kw(args, message)
         elif cmd == "session":
             text = await cmd_session(args, message)
         else:

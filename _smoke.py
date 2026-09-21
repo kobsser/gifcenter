@@ -24,13 +24,17 @@ def ok(name):
 bot.state.update(groups=[-1001, -1002], dest=-2001, delay=1.5)
 bot.save_state(bot.state)
 reloaded = bot.load_state()
-assert reloaded == {"groups": [-1001, -1002], "dest": -2001, "delay": 1.5, "dedup": True}, reloaded
+assert reloaded == {"groups": [-1001, -1002], "dest": -2001, "delay": 1.5, "dedup": True,
+                       "keywords": [], "keywords_enabled": False,
+                       "keyword_allow_all": False, "keyword_users": []}, reloaded
 ok("state save/load round-trip")
 
 # load_state on missing file -> defaults
 os.remove(bot.STATE_FILE)
 d = bot.load_state()
-assert d == {"groups": [], "dest": None, "delay": 2.0, "dedup": True}, d
+assert d == {"groups": [], "dest": None, "delay": 2.0, "dedup": True,
+             "keywords": [], "keywords_enabled": False,
+             "keyword_allow_all": False, "keyword_users": []}, d
 ok("load_state defaults on missing file")
 
 # ── fakes ──
@@ -58,6 +62,8 @@ class Msg:
         s.has_protected_content = protected
         s.command = command
         s.id = mid
+        s.text = None
+        s.reply_to_message = None
 
 client = bot.client
 me = U(5, self_=True)
@@ -216,13 +222,29 @@ calls.clear()
 r2 = asyncio.run(bot.clone_media(Msg(fid="F9-new", unique_id="U9")))
 assert r2 is False and calls == [], (r2, calls)
 ok("dedup on: duplicate gif skipped, no second send")
-assert bot.db.execute("SELECT dest_file_id, dest FROM sent WHERE file_unique_id='U9'").fetchall() == [("DEST-F9", -2001)]
+assert bot.db.execute("SELECT dest_file_id, dest_file_unique_id, dest FROM sent WHERE file_unique_id='U9'").fetchall() == [("DEST-F9", "DEST-UNIQUE", -2001)]
 ok("dedup: sent gif recorded in sent.db")
 bot.state.update(dest=-2002)
 calls.clear()
 r3 = asyncio.run(bot.clone_media(Msg(fid="F9", unique_id="U9")))
 assert r3 is True and calls == [("cached", -2002, "F9")], (r3, calls)
 ok("dedup: dest-scoped, new dest allowed")
+# If the source GIF was previously sent to this destination by someone else,
+# its source unique_id can equal the stored destination unique_id. Reuse it.
+bot.db.execute(
+    "INSERT INTO sent (file_unique_id, dest_file_id, dest_file_unique_id, dest, sent_at) VALUES (?, ?, ?, ?, datetime('now'))",
+    ("OTHER-SOURCE", "DEST-KNOWN", "KNOWN-DEST-UNIQUE", -2003),
+)
+bot.db.commit()
+bot.state.update(dest=-2003, dedup=True)
+calls.clear()
+r_known = asyncio.run(bot.clone_media(Msg(fid="NEW-SOURCE-ID", unique_id="KNOWN-DEST-UNIQUE")))
+assert r_known is False and calls == [], (r_known, calls)
+# A forced keyword resend reuses that destination file_id instead of uploading.
+calls.clear()
+r_known_force = asyncio.run(bot.clone_media(Msg(fid="NEW-SOURCE-ID", unique_id="KNOWN-DEST-UNIQUE"), force=True))
+assert r_known_force is True and calls == [("cached", -2003, "DEST-KNOWN")], (r_known_force, calls)
+ok("dedup: destination file_unique_id prevents re-upload and supports reuse")
 bot.state.update(dest=-2002, dedup=False)
 calls.clear()
 r4 = asyncio.run(bot.clone_media(Msg(fid="F9", unique_id="U9")))
@@ -248,4 +270,88 @@ m11 = DMsg(999, ["gc", "dedup", "on"])
 asyncio.run(bot.gc_command(None, m11))
 assert m11.replies == [] and m11.edits == [] and bot.state["dedup"] is False, (m11.edits, bot.state)
 ok("gc_command: non-owner .gc dedup ignored")
+
+# ── keyword configuration ──
+bot.state.update(keywords=[], keywords_enabled=False, keyword_allow_all=False, keyword_users=[])
+for cmd, expected in [
+    (["gc", "kw", "add", "again"], "keyword added: again"),
+    (["gc", "kw", "on"], "keywords: on"),
+    (["gc", "kw", "all", "off"], "keyword everyone: off"),
+    (["gc", "kw", "user", "add", "123"], "keyword user allowed: 123"),
+]:
+    m = DMsg(5, cmd)
+    asyncio.run(bot.gc_command(None, m))
+    assert m.edits == [expected], (cmd, m.edits)
+assert bot.state["keywords"] == ["again"] and bot.state["keywords_enabled"]
+assert bot.state["keyword_users"] == [123] and not bot.state["keyword_allow_all"]
+ok("gc_command: keyword add/on/allowlist config")
+m = DMsg(5, ["gc", "kw", "list"])
+asyncio.run(bot.gc_command(None, m))
+assert "• again" in m.edits[0] and "everyone: off" in m.edits[0]
+ok("gc_command: keyword list")
+
+# ── keyword reply trigger ──
+client.send_cached_media = cached
+bot.state.update(groups=[-1001], dest=-2001, keywords=["again"], keywords_enabled=True,
+                 keyword_allow_all=False, keyword_users=[123], dedup=True, delay=0.0)
+source = Msg(gid=-1001, from_id=77, fid="KW-SOURCE", unique_id="KW-U", mid=900)
+reply = Msg(gid=-1001, from_id=123, anim=False, mid=901)
+reply.text = "again"
+reply.reply_to_message = source
+calls.clear()
+asyncio.run(bot.on_group_message(None, reply))
+assert calls == [("cached", -2001, "KW-SOURCE")], calls
+ok("keyword reply: whitelisted user re-sends GIF")
+
+blocked = Msg(gid=-1001, from_id=456, anim=False, mid=902)
+blocked.text = "again"
+blocked.reply_to_message = source
+calls.clear()
+asyncio.run(bot.on_group_message(None, blocked))
+assert calls == [], calls
+ok("keyword reply: non-whitelisted user blocked")
+
+bot.state["keyword_allow_all"] = True
+calls.clear()
+asyncio.run(bot.on_group_message(None, blocked))
+assert calls == [("cached", -2001, "DEST-KW-SOURCE")], calls
+ok("keyword reply: everyone toggle allows all users")
+
+# ── global send queue ──
+# All entry points use the same queue, so concurrent sends are serialized and
+# the configured delay is enforced between successful sends.
+orig_clone_media = bot.clone_media
+queue_events = []
+
+
+async def fake_clone(message, *, force=False):
+    queue_events.append(("send", message.id, force, asyncio.get_running_loop().time()))
+    return True
+
+
+async def queue_test():
+    bot.clone_media = fake_clone
+    bot.state["delay"] = 0.03
+    m_a = Msg(mid=1001)
+    m_b = Msg(mid=1002)
+    m_c = Msg(mid=1003)
+    await asyncio.gather(
+        bot.send_to_dest(m_a),
+        bot.send_to_dest_with_force(m_b),
+        bot.send_to_dest(m_c),
+    )
+
+
+asyncio.run(queue_test())
+bot.clone_media = orig_clone_media
+assert [(e[1], e[2]) for e in queue_events] == [(1001, False), (1002, True), (1003, False)], queue_events
+assert queue_events[2][3] - queue_events[1][3] >= 0.025, queue_events
+assert queue_events[1][3] - queue_events[0][3] >= 0.025, queue_events
+ok("global send queue: watcher/load/keyword sends share FIFO + delay")
+
+# The smoke loop is closing, so stop its worker before the next asyncio.run.
+if bot.send_worker_task is not None:
+    bot.send_worker_task.cancel()
+bot.send_worker_task = None
+
 print(f"\nALL {len(passed)} PASSED")
