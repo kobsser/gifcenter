@@ -25,7 +25,7 @@ bot.state.update(groups=[-1001, -1002], dest=-2001, delay=1.5)
 bot.save_state(bot.state)
 reloaded = bot.load_state()
 assert reloaded == {"groups": [-1001, -1002], "dest": -2001, "delay": 1.5, "dedup": True,
-                       "keywords": [], "keywords_enabled": False,
+                       "keywords_exact": [], "keywords_contains": [], "keywords_enabled": False,
                        "keyword_allow_all": False, "keyword_users": []}, reloaded
 ok("state save/load round-trip")
 
@@ -33,7 +33,7 @@ ok("state save/load round-trip")
 os.remove(bot.STATE_FILE)
 d = bot.load_state()
 assert d == {"groups": [], "dest": None, "delay": 2.0, "dedup": True,
-             "keywords": [], "keywords_enabled": False,
+             "keywords_exact": [], "keywords_contains": [], "keywords_enabled": False,
              "keyword_allow_all": False, "keyword_users": []}, d
 ok("load_state defaults on missing file")
 
@@ -272,9 +272,10 @@ assert m11.replies == [] and m11.edits == [] and bot.state["dedup"] is False, (m
 ok("gc_command: non-owner .gc dedup ignored")
 
 # ── keyword configuration ──
-bot.state.update(keywords=[], keywords_enabled=False, keyword_allow_all=False, keyword_users=[])
+bot.state.update(keywords_exact=[], keywords_contains=[], keywords_enabled=False, keyword_allow_all=False, keyword_users=[])
 for cmd, expected in [
-    (["gc", "kw", "add", "again"], "keyword added: again"),
+    (["gc", "kw", "add", "exact", "again"], "exact keyword added: again"),
+    (["gc", "kw", "add", "contains", "please again"], "contains keyword added: please again"),
     (["gc", "kw", "on"], "keywords: on"),
     (["gc", "kw", "all", "off"], "keyword everyone: off"),
     (["gc", "kw", "user", "add", "123"], "keyword user allowed: 123"),
@@ -282,17 +283,17 @@ for cmd, expected in [
     m = DMsg(5, cmd)
     asyncio.run(bot.gc_command(None, m))
     assert m.edits == [expected], (cmd, m.edits)
-assert bot.state["keywords"] == ["again"] and bot.state["keywords_enabled"]
+assert bot.state["keywords_exact"] == ["again"] and bot.state["keywords_contains"] == ["please again"] and bot.state["keywords_enabled"]
 assert bot.state["keyword_users"] == [123] and not bot.state["keyword_allow_all"]
 ok("gc_command: keyword add/on/allowlist config")
 m = DMsg(5, ["gc", "kw", "list"])
 asyncio.run(bot.gc_command(None, m))
-assert "• again" in m.edits[0] and "everyone: off" in m.edits[0]
+assert "• again" in m.edits[0] and "• please again" in m.edits[0] and "everyone: off" in m.edits[0]
 ok("gc_command: keyword list")
 
 # ── keyword reply trigger ──
 client.send_cached_media = cached
-bot.state.update(groups=[-1001], dest=-2001, keywords=["again"], keywords_enabled=True,
+bot.state.update(groups=[-1001], dest=-2001, keywords_exact=["again"], keywords_contains=["please again"], keywords_enabled=True,
                  keyword_allow_all=False, keyword_users=[123], dedup=True, delay=0.0)
 source = Msg(gid=-1001, from_id=77, fid="KW-SOURCE", unique_id="KW-U", mid=900)
 reply = Msg(gid=-1001, from_id=123, anim=False, mid=901)
@@ -301,7 +302,15 @@ reply.reply_to_message = source
 calls.clear()
 asyncio.run(bot.on_group_message(None, reply))
 assert calls == [("cached", -2001, "KW-SOURCE")], calls
-ok("keyword reply: whitelisted user re-sends GIF")
+ok("keyword reply: exact keyword re-sends GIF")
+
+contains_reply = Msg(gid=-1001, from_id=123, anim=False, mid=903)
+contains_reply.text = "please again now"
+contains_reply.reply_to_message = source
+calls.clear()
+asyncio.run(bot.on_group_message(None, contains_reply))
+assert calls == [("cached", -2001, "DEST-KW-SOURCE")], calls
+ok("keyword reply: contains keyword re-sends GIF")
 
 blocked = Msg(gid=-1001, from_id=456, anim=False, mid=902)
 blocked.text = "again"

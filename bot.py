@@ -55,8 +55,8 @@ client = Client(
 
 DEFAULT_STATE = {
     "groups": [], "dest": None, "delay": 2.0, "dedup": True,
-    "keywords": [], "keywords_enabled": False, "keyword_allow_all": False,
-    "keyword_users": [],
+    "keywords_exact": [], "keywords_contains": [],
+    "keywords_enabled": False, "keyword_allow_all": False, "keyword_users": [],
 }
 
 
@@ -70,7 +70,13 @@ def load_state() -> dict:
         state.setdefault(key, default)
     state["groups"] = [int(g) for g in state["groups"]]
     state["delay"] = float(state["delay"])
-    state["keywords"] = [str(k).casefold() for k in state["keywords"] if str(k).strip()]
+    legacy_keywords = state.pop("keywords", [])
+    state["keywords_exact"] = [str(k).casefold() for k in state["keywords_exact"] if str(k).strip()]
+    state["keywords_contains"] = [str(k).casefold() for k in state["keywords_contains"] if str(k).strip()]
+    for keyword in legacy_keywords:
+        keyword = str(keyword).strip().casefold()
+        if keyword and keyword not in state["keywords_exact"]:
+            state["keywords_exact"].append(keyword)
     state["keyword_users"] = [int(u) for u in state["keyword_users"]]
     return state
 
@@ -325,8 +331,11 @@ async def on_group_message(app, message, *a):
         return
     if not state["keywords_enabled"] or not message.text:
         return
-    keyword = message.text.strip().casefold()
-    if keyword not in state["keywords"]:
+    text = message.text.strip().casefold()
+    exact = next((k for k in state["keywords_exact"] if text == k), None)
+    contains = next((k for k in state["keywords_contains"] if k in text), None)
+    keyword = exact or contains
+    if keyword is None:
         return
     if not state["keyword_allow_all"] and message.from_user.id not in state["keyword_users"]:
         log.info("keyword %r ignored for user %s: not whitelisted", keyword, message.from_user.id)
@@ -355,9 +364,10 @@ HELP_TEXT = (
     f"  {PREFIX}gc kw ...               Re-send a replied GIF when a keyword is posted\n"
     f"  {PREFIX}gc session              Export the current session string\n\n"
     f"KEYWORDS\n"
-    f"  {PREFIX}gc kw add <text>        Add a keyword (exact, case-insensitive match)\n"
-    f"  {PREFIX}gc kw remove <text>     Remove a keyword\n"
-    f"  {PREFIX}gc kw list              List keywords and current access mode\n"
+    f"  {PREFIX}gc kw add exact <text>    Add an exact-match keyword\n"
+    f"  {PREFIX}gc kw add contains <text> Add a contains-match keyword\n"
+    f"  {PREFIX}gc kw remove <text>      Remove a keyword\n"
+    f"  {PREFIX}gc kw list               List keywords and current access mode\n"
     f"  {PREFIX}gc kw on|off             Enable/disable keyword triggers\n"
     f"  {PREFIX}gc kw all on|off         Allow everyone or whitelist only\n"
     f"  {PREFIX}gc kw user add <id>      Add a user to the keyword whitelist\n"
@@ -549,14 +559,16 @@ async def cmd_kw(args, message) -> str:
     if len(args) < 2:
         return ("kw: " + ("on" if state["keywords_enabled"] else "off") +
                 f"; everyone: {'on' if state['keyword_allow_all'] else 'off'}\n"
-                f"keywords: {', '.join(state['keywords']) or '(none)'}\n"
+                f"exact: {', '.join(state['keywords_exact']) or '(none)'}\n"
+                f"contains: {', '.join(state['keywords_contains']) or '(none)'}\n"
                 f"users: {', '.join(map(str, state['keyword_users'])) or '(none)'}\n"
                 "usage: .gc kw <add|list|remove|on|off|all|user> ...")
     sub = args[1].casefold()
     if sub == "help":
-        return (".gc kw add <keyword>\n.gc kw list\n.gc kw remove <keyword>\n"
-                ".gc kw on|off\n.gc kw all on|off\n"
-                ".gc kw user add <user_id>\n.gc kw user remove <user_id>\n.gc kw user list")
+        return (".gc kw add exact <keyword>\n.gc kw add contains <keyword>\n"
+                ".gc kw list\n.gc kw remove <keyword>\n.gc kw on|off\n"
+                ".gc kw all on|off\n.gc kw user add <user_id>\n"
+                ".gc kw user remove <user_id>\n.gc kw user list")
     if sub in ("on", "off"):
         state["keywords_enabled"] = sub == "on"
         save_state(state)
@@ -568,21 +580,29 @@ async def cmd_kw(args, message) -> str:
         save_state(state)
         return f"keyword everyone: {args[2].casefold()}"
     if sub == "add":
-        keyword = " ".join(args[2:]).strip().casefold()
+        if len(args) < 4 or args[2].casefold() not in ("exact", "contains"):
+            return "usage: .gc kw add <exact|contains> <keyword>"
+        match_type = args[2].casefold()
+        keyword = " ".join(args[3:]).strip().casefold()
         if not keyword:
-            return "usage: .gc kw add <keyword>"
-        if keyword in state["keywords"]:
+            return "usage: .gc kw add <exact|contains> <keyword>"
+        key = "keywords_exact" if match_type == "exact" else "keywords_contains"
+        if keyword in state[key]:
             return "keyword already exists"
-        state["keywords"].append(keyword)
+        state[key].append(keyword)
         save_state(state)
-        return f"keyword added: {keyword}"
+        return f"{match_type} keyword added: {keyword}"
     if sub == "remove":
         keyword = " ".join(args[2:]).strip().casefold()
         if not keyword:
             return "usage: .gc kw remove <keyword>"
-        if keyword not in state["keywords"]:
+        removed = False
+        for key in ("keywords_exact", "keywords_contains"):
+            if keyword in state[key]:
+                state[key].remove(keyword)
+                removed = True
+        if not removed:
             return "keyword not found"
-        state["keywords"].remove(keyword)
         save_state(state)
         return f"keyword removed: {keyword}"
     if sub == "list":
@@ -590,7 +610,10 @@ async def cmd_kw(args, message) -> str:
             f"keywords: {'on' if state['keywords_enabled'] else 'off'}",
             f"everyone: {'on' if state['keyword_allow_all'] else 'off'}",
         ]
-        lines.extend(f"• {k}" for k in state["keywords"] or ["(none)"])
+        lines.append("exact:")
+        lines.extend(f"• {k}" for k in state["keywords_exact"] or ["(none)"])
+        lines.append("contains:")
+        lines.extend(f"• {k}" for k in state["keywords_contains"] or ["(none)"])
         return "\n".join(lines)
     if sub == "user":
         if len(args) < 3 or args[2].casefold() not in ("add", "remove", "list"):
