@@ -82,6 +82,19 @@ r = asyncio.run(bot.clone_media(Msg(protected=False, fid="F1")))
 assert r is True and calls == [("cached", -2001, "F1")], (r, calls)
 ok("clone_media unprotected -> send_cached_media(file_id)")
 
+# ── Telegram can report forward restriction even when the message flag is false ──
+async def restricted(cid, fid, *a, **k):
+    calls.append(("cached-restricted", cid, fid))
+    raise errors.ChatForwardsRestricted("protected chat")
+
+client.send_cached_media = restricted
+calls.clear()
+r = asyncio.run(bot.clone_media(Msg(protected=False, fid="F1-restricted")))
+assert r is True, r
+assert calls[0] == ("cached-restricted", -2001, "F1-restricted")
+assert calls[1][0] == "dl" and calls[2] == ("anim", -2001, calls[1][1]), calls
+ok("clone_media forward restriction -> download + reupload fallback")
+
 # ── clone protected -> download into tmpdir + reupload ──
 calls.clear()
 r = asyncio.run(bot.clone_media(Msg(protected=True, fid="F2")))

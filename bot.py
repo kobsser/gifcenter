@@ -130,13 +130,41 @@ async def clone_media(message: Message):
         log.info("skip %s/%s: gif %s already in dest", message.chat.id, message.id, file_id)
         return False
 
-    if not message.has_protected_content:
-        ok = await send_with_flood_retry("send_cached_media", dest, file_id) is not None
-    else:
-        # Protected: file_id cannot be reused → download + reupload.
+    async def reupload_protected() -> bool:
+        # Protected/no-forward GIFs cannot be sent by file_id.
         with tempfile.TemporaryDirectory(dir=DATA_DIR, prefix="gif_") as tmpdir:
-            path = await client.download_media(message, file_name=os.path.join(tmpdir, "gif.mp4"), in_memory=False)
-            ok = await send_with_flood_retry("send_animation", dest, path) is not None
+            path = await client.download_media(
+                message,
+                file_name=os.path.join(tmpdir, "gif.mp4"),
+                in_memory=False,
+            )
+            if not path:
+                log.warning("skip %s/%s: could not download protected GIF",
+                            message.chat.id, message.id)
+                return False
+            return await send_with_flood_retry("send_animation", dest, path) is not None
+
+    if message.has_protected_content:
+        log.info(
+            "GIF %s/%s: re-uploading because has_protected_content=True",
+            message.chat.id,
+            message.id,
+        )
+        ok = await reupload_protected()
+    else:
+        try:
+            ok = await send_with_flood_retry("send_cached_media", dest, file_id) is not None
+        except errors.ChatForwardsRestricted:
+            # Telegram can report a protected/no-forward restriction even when
+            # has_protected_content is false/stale. Fall back to re-upload so
+            # this RPC error never escapes the message handler.
+            log.info(
+                "GIF %s/%s: re-uploading because send_cached_media raised "
+                "ChatForwardsRestricted (has_protected_content=False)",
+                message.chat.id,
+                message.id,
+            )
+            ok = await reupload_protected()
 
     if ok:
         db.execute("INSERT INTO sent (file_id, dest, sent_at) VALUES (?, ?, datetime('now'))",
