@@ -6,3 +6,4 @@ __pycache__/
 .venv/
 state.json
 downloads/
+README.md
