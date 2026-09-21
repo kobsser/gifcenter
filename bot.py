@@ -11,6 +11,7 @@ import asyncio
 import json
 import logging
 import os
+import sqlite3
 import tempfile
 from pathlib import Path
 
@@ -52,7 +53,7 @@ client = Client(
 
 # ─────────────────────────── state ───────────────────────────
 
-DEFAULT_STATE = {"groups": [], "dest": None, "delay": 2.0}
+DEFAULT_STATE = {"groups": [], "dest": None, "delay": 2.0, "dedup": True}
 
 
 def load_state() -> dict:
@@ -77,6 +78,15 @@ def save_state(state: dict) -> None:
 
 state = load_state()
 send_lock = asyncio.Lock()  # serializes clones from listener + .gc load
+
+SENT_DB = DATA_DIR / "sent.db"
+db = sqlite3.connect(str(SENT_DB))
+db.execute(
+    "CREATE TABLE IF NOT EXISTS sent ("
+    "file_id TEXT NOT NULL, dest INTEGER NOT NULL, sent_at TEXT NOT NULL)"
+)
+db.execute("CREATE INDEX IF NOT EXISTS sent_ix ON sent (file_id, dest)")
+db.commit()
 
 # ─────────────────────────── send core ───────────────────────────
 
@@ -105,7 +115,7 @@ async def send_with_flood_retry(fn: str, *args, tries: int = 5):
 
 
 async def clone_media(message: Message):
-    """Clone one GIF message to the destination chat. True on success."""
+    """Clone one GIF message to the destination chat. True on success, False on skip/failure."""
     dest = state["dest"]
     if dest is None:
         log.warning("GIF from %s/%s skipped: no destination set (.gc dest <chat_id>)",
@@ -113,13 +123,26 @@ async def clone_media(message: Message):
         return False
 
     anim = message.animation
-    if not message.has_protected_content:
-        return await send_with_flood_retry("send_cached_media", dest, anim.file_id) is not None
+    file_id = anim.file_id
+    if state["dedup"] and db.execute(
+            "SELECT 1 FROM sent WHERE file_id = ? AND dest = ?",
+            (file_id, dest)).fetchone():
+        log.info("skip %s/%s: gif %s already in dest", message.chat.id, message.id, file_id)
+        return False
 
-    # Protected: file_id cannot be reused → download + reupload.
-    with tempfile.TemporaryDirectory(dir=DATA_DIR, prefix="gif_") as tmpdir:
-        path = await client.download_media(message, file_name=os.path.join(tmpdir, "gif.mp4"), in_memory=False)
-        return await send_with_flood_retry("send_animation", dest, path) is not None
+    if not message.has_protected_content:
+        ok = await send_with_flood_retry("send_cached_media", dest, file_id) is not None
+    else:
+        # Protected: file_id cannot be reused → download + reupload.
+        with tempfile.TemporaryDirectory(dir=DATA_DIR, prefix="gif_") as tmpdir:
+            path = await client.download_media(message, file_name=os.path.join(tmpdir, "gif.mp4"), in_memory=False)
+            ok = await send_with_flood_retry("send_animation", dest, path) is not None
+
+    if ok:
+        db.execute("INSERT INTO sent (file_id, dest, sent_at) VALUES (?, ?, datetime('now'))",
+                   (file_id, dest))
+        db.commit()
+    return ok
 
 
 async def send_to_dest(message: Message) -> bool:
@@ -156,6 +179,7 @@ HELP_TEXT = (
     f"{PREFIX}gc dest <chat_id>      where GIFs get cloned (channel or group)\n"
     f"{PREFIX}gc load <group_id> <n> clone last n messages' GIFs (1–50000)\n"
     f"{PREFIX}gc delay <seconds>     pause between clones (0.1–3600, default 2)\n"
+    f"{PREFIX}gc dedup [on|off]      skip GIFs already sent to the destination (on/off)\n"
     f"{PREFIX}gc session             export your session string (for porting)\n"
     f"{PREFIX}gc help                this text"
 )
@@ -236,6 +260,7 @@ async def cmd_list(args, message) -> str:
     else:
         lines.append("dest: not set")
     lines.append(f"delay: {state['delay']}s")
+    lines.append(f"dedup: {'on' if state['dedup'] else 'off'}")
     return "\n".join(lines)
 
 
@@ -324,6 +349,17 @@ async def cmd_delay(args, message) -> str:
     return f"delay: {d}s"
 
 
+async def cmd_dedup(args, message) -> str:
+    if len(args) < 2:
+        return f"dedup: {'on' if state['dedup'] else 'off'}. usage: .gc dedup <on|off>"
+    v = args[1].lower()
+    if v not in ("on", "off"):
+        return "dedup must be on or off"
+    state["dedup"] = v == "on"
+    save_state(state)
+    return f"dedup: {v}"
+
+
 async def cmd_session(args, message) -> str:
     try:
         s = await client.export_session_string()
@@ -354,6 +390,8 @@ async def gc_command(app, message: Message, *a):
             text = await cmd_load(args, message)
         elif cmd == "delay":
             text = await cmd_delay(args, message)
+        elif cmd == "dedup":
+            text = await cmd_dedup(args, message)
         elif cmd == "session":
             text = await cmd_session(args, message)
         else:

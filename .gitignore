@@ -6,4 +6,5 @@ __pycache__/
 .venv/
 state.json
 downloads/
+sent.db
 README.md

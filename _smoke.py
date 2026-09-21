@@ -24,13 +24,13 @@ def ok(name):
 bot.state.update(groups=[-1001, -1002], dest=-2001, delay=1.5)
 bot.save_state(bot.state)
 reloaded = bot.load_state()
-assert reloaded == {"groups": [-1001, -1002], "dest": -2001, "delay": 1.5}, reloaded
+assert reloaded == {"groups": [-1001, -1002], "dest": -2001, "delay": 1.5, "dedup": True}, reloaded
 ok("state save/load round-trip")
 
 # load_state on missing file -> defaults
 os.remove(bot.STATE_FILE)
 d = bot.load_state()
-assert d == {"groups": [], "dest": None, "delay": 2.0}, d
+assert d == {"groups": [], "dest": None, "delay": 2.0, "dedup": True}, d
 ok("load_state defaults on missing file")
 
 # ── fakes ──
@@ -46,13 +46,13 @@ class Mem:
     def __init__(s, status): s.status = status
 
 class Anim:
-    file_id = "FID"
+    def __init__(s, fid="FID"): s.file_id = fid
 
 class Msg:
-    def __init__(s, *, gid=-1001, from_id=5, self_=False, anim=True, protected=False, command=None, mid=42):
+    def __init__(s, *, gid=-1001, from_id=5, self_=False, anim=True, protected=False, command=None, mid=42, fid="FID"):
         s.chat = Chat(gid, "supergroup")
         s.from_user = U(from_id, self_)
-        s.animation = Anim() if anim else None
+        s.animation = Anim(fid) if anim else None
         s.has_protected_content = protected
         s.command = command
         s.id = mid
@@ -78,13 +78,13 @@ client.download_media = dl
 # ── clone unprotected -> cached file_id ──
 bot.state.update(dest=-2001)
 calls.clear()
-r = asyncio.run(bot.clone_media(Msg(protected=False)))
-assert r is True and calls == [("cached", -2001, "FID")], (r, calls)
+r = asyncio.run(bot.clone_media(Msg(protected=False, fid="F1")))
+assert r is True and calls == [("cached", -2001, "F1")], (r, calls)
 ok("clone_media unprotected -> send_cached_media(file_id)")
 
 # ── clone protected -> download into tmpdir + reupload ──
 calls.clear()
-r = asyncio.run(bot.clone_media(Msg(protected=True)))
+r = asyncio.run(bot.clone_media(Msg(protected=True, fid="F2")))
 assert r is True, r
 assert calls[0][0] == "dl" and os.path.dirname(calls[0][1]).startswith(tmp), calls
 assert calls[1] == ("anim", -2001, calls[0][1]), calls
@@ -107,7 +107,7 @@ client.send_cached_media = flaky
 bot.state.update(dest=-2001)
 asyncio.get_event_loop_policy()
 calls.clear()
-r = asyncio.run(bot.clone_media(Msg(protected=False)))
+r = asyncio.run(bot.clone_media(Msg(protected=False, fid="F3")))
 assert r is True and n["c"] == 3, (r, n)
 ok("send_with_flood_retry: retries through FloodWait to success")
 
@@ -115,7 +115,7 @@ ok("send_with_flood_retry: retries through FloodWait to success")
 async def alwaysflood(*a, **k):
     raise errors.FloodWait(0)
 client.send_cached_media = alwaysflood
-r = asyncio.run(bot.clone_media(Msg(protected=False)))
+r = asyncio.run(bot.clone_media(Msg(protected=False, fid="F4")))
 assert r is False, r
 ok("send_with_flood_retry: gives up after 5 FloodWaits -> False")
 
@@ -149,7 +149,7 @@ assert m2.replies == [] and m2.edits == ["delay: 1.5s"], (m2.replies, m2.edits)
 ok("gc_command: owner .gc delay 1.5 updates state + confirms")
 m3 = DMsg(5, ["gc", "list"])
 asyncio.run(bot.gc_command(None, m3))
-assert m3.replies == [] and m3.edits == ["no groups watched\ndest: not set\ndelay: 1.5s"], (m3.replies, m3.edits)
+assert m3.replies == [] and m3.edits == ["no groups watched\ndest: not set\ndelay: 1.5s\ndedup: on"], (m3.replies, m3.edits)
 ok("gc_command: owner .gc list renders state")
 
 m4 = DMsg(5, ["gc", "nope"])
@@ -189,4 +189,46 @@ asyncio.run(bot.gc_command(None, m7))
 assert m7.edits and m7.edits[0].startswith("sent"), m7.edits
 ok("gc_command: .gc load accepts n = 50000")
 
+# ── dedup: skip re-sends, record in sqlite ──
+client.send_cached_media = cached
+bot.state.update(dedup=True, dest=-2001)
+calls.clear()
+r1 = asyncio.run(bot.clone_media(Msg(fid="F9")))
+assert r1 is True and calls == [("cached", -2001, "F9")], (r1, calls)
+calls.clear()
+r2 = asyncio.run(bot.clone_media(Msg(fid="F9")))
+assert r2 is False and calls == [], (r2, calls)
+ok("dedup on: duplicate gif skipped, no second send")
+assert bot.db.execute("SELECT dest FROM sent WHERE file_id='F9'").fetchall() == [(-2001,)]
+ok("dedup: sent gif recorded in sent.db")
+bot.state.update(dest=-2002)
+calls.clear()
+r3 = asyncio.run(bot.clone_media(Msg(fid="F9")))
+assert r3 is True and calls == [("cached", -2002, "F9")], (r3, calls)
+ok("dedup: dest-scoped, new dest allowed")
+bot.state.update(dest=-2002, dedup=False)
+calls.clear()
+r4 = asyncio.run(bot.clone_media(Msg(fid="F9")))
+assert r4 is True and calls == [("cached", -2002, "F9")], (r4, calls)
+assert bot.db.execute("SELECT COUNT(*) FROM sent WHERE file_id='F9' AND dest=-2002").fetchone() == (2,)
+ok("dedup off: re-sends + still records in db")
+bot.state.update(dedup=True, dest=None)
+m8 = DMsg(5, ["gc", "dedup", "off"])
+asyncio.run(bot.gc_command(None, m8))
+assert m8.edits == ["dedup: off"], m8.edits
+assert bot.state["dedup"] is False and bot.load_state()["dedup"] is False, bot.state
+ok("gc_command: owner .gc dedup off toggles + persists")
+m9 = DMsg(5, ["gc", "dedup", "maybe"])
+asyncio.run(bot.gc_command(None, m9))
+assert m9.edits == ["dedup must be on or off"], m9.edits
+assert bot.state["dedup"] is False
+ok("gc_command: .gc dedup maybe rejected, state unchanged")
+m10 = DMsg(5, ["gc", "dedup"])
+asyncio.run(bot.gc_command(None, m10))
+assert m10.edits and m10.edits[0].startswith("dedup: off. usage:"), m10.edits
+ok("gc_command: .gc dedup no-arg shows current")
+m11 = DMsg(999, ["gc", "dedup", "on"])
+asyncio.run(bot.gc_command(None, m11))
+assert m11.replies == [] and m11.edits == [] and bot.state["dedup"] is False, (m11.edits, bot.state)
+ok("gc_command: non-owner .gc dedup ignored")
 print(f"\nALL {len(passed)} PASSED")
