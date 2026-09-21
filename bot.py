@@ -83,9 +83,16 @@ SENT_DB = DATA_DIR / "sent.db"
 db = sqlite3.connect(str(SENT_DB))
 db.execute(
     "CREATE TABLE IF NOT EXISTS sent ("
-    "file_id TEXT NOT NULL, dest INTEGER NOT NULL, sent_at TEXT NOT NULL)"
+    "file_unique_id TEXT, dest_file_id TEXT, dest INTEGER NOT NULL, sent_at TEXT NOT NULL)"
 )
-db.execute("CREATE INDEX IF NOT EXISTS sent_ix ON sent (file_id, dest)")
+# Migrate the old schema without trusting its file_id values: those rows used the
+# source chat file_id, which is not the destination file_id we need for reuse.
+columns = {row[1] for row in db.execute("PRAGMA table_info(sent)")}
+if "file_unique_id" not in columns:
+    db.execute("ALTER TABLE sent ADD COLUMN file_unique_id TEXT")
+if "dest_file_id" not in columns:
+    db.execute("ALTER TABLE sent ADD COLUMN dest_file_id TEXT")
+db.execute("CREATE INDEX IF NOT EXISTS sent_ix ON sent (file_unique_id, dest)")
 db.commit()
 
 # ─────────────────────────── send core ───────────────────────────
@@ -115,7 +122,12 @@ async def send_with_flood_retry(fn: str, *args, tries: int = 5):
 
 
 async def clone_media(message: Message):
-    """Clone one GIF message to the destination chat. True on success, False on skip/failure."""
+    """Clone one GIF message to the destination chat.
+
+    file_unique_id identifies the source GIF for deduplication.  The
+    destination's file_id is cached separately so dedup-off can resend that
+    already-uploaded copy instead of uploading the GIF again.
+    """
     dest = state["dest"]
     if dest is None:
         log.warning("GIF from %s/%s skipped: no destination set (.gc dest <chat_id>)",
@@ -123,14 +135,38 @@ async def clone_media(message: Message):
         return False
 
     anim = message.animation
-    file_id = anim.file_id
-    if state["dedup"] and db.execute(
-            "SELECT 1 FROM sent WHERE file_id = ? AND dest = ?",
-            (file_id, dest)).fetchone():
-        log.info("skip %s/%s: gif %s already in dest", message.chat.id, message.id, file_id)
-        return False
+    source_file_id = anim.file_id
+    source_unique_id = anim.file_unique_id
+    cached = db.execute(
+        "SELECT dest_file_id FROM sent "
+        "WHERE file_unique_id = ? AND dest = ? AND dest_file_id IS NOT NULL "
+        "ORDER BY rowid DESC LIMIT 1",
+        (source_unique_id, dest),
+    ).fetchone()
 
-    async def reupload_protected() -> bool:
+    if cached:
+        if state["dedup"]:
+            log.info(
+                "skip %s/%s: gif unique_id=%s already in dest",
+                message.chat.id, message.id, source_unique_id,
+            )
+            return False
+
+        log.info(
+            "GIF %s/%s: dedup off — reusing destination file_id=%s "
+            "for unique_id=%s (no re-upload)",
+            message.chat.id, message.id, cached[0], source_unique_id,
+        )
+        try:
+            return await send_with_flood_retry("send_cached_media", dest, cached[0]) is not None
+        except errors.RPCError:
+            log.warning(
+                "GIF %s/%s: cached destination file_id=%s failed; "
+                "falling back to a fresh clone",
+                message.chat.id, message.id, cached[0],
+            )
+
+    async def reupload_protected():
         # Protected/no-forward GIFs cannot be sent by file_id.
         with tempfile.TemporaryDirectory(dir=DATA_DIR, prefix="gif_") as tmpdir:
             path = await client.download_media(
@@ -141,19 +177,22 @@ async def clone_media(message: Message):
             if not path:
                 log.warning("skip %s/%s: could not download protected GIF",
                             message.chat.id, message.id)
-                return False
-            return await send_with_flood_retry("send_animation", dest, path) is not None
+                return None
+            return await send_with_flood_retry("send_animation", dest, path)
 
+    sent_message = None
     if message.has_protected_content:
         log.info(
             "GIF %s/%s: re-uploading because has_protected_content=True",
             message.chat.id,
             message.id,
         )
-        ok = await reupload_protected()
+        sent_message = await reupload_protected()
     else:
         try:
-            ok = await send_with_flood_retry("send_cached_media", dest, file_id) is not None
+            sent_message = await send_with_flood_retry(
+                "send_cached_media", dest, source_file_id
+            )
         except errors.ChatForwardsRestricted:
             # Telegram can report a protected/no-forward restriction even when
             # has_protected_content is false/stale. Fall back to re-upload so
@@ -164,13 +203,32 @@ async def clone_media(message: Message):
                 message.chat.id,
                 message.id,
             )
-            ok = await reupload_protected()
+            sent_message = await reupload_protected()
 
-    if ok:
-        db.execute("INSERT INTO sent (file_id, dest, sent_at) VALUES (?, ?, datetime('now'))",
-                   (file_id, dest))
-        db.commit()
-    return ok
+    if sent_message is None:
+        return False
+
+    dest_anim = getattr(sent_message, "animation", None)
+    dest_file_id = getattr(dest_anim, "file_id", None)
+    if not dest_file_id:
+        log.error(
+            "GIF %s/%s: send succeeded but destination animation has no file_id; "
+            "not caching the result",
+            message.chat.id, message.id,
+        )
+        return True
+
+    db.execute(
+        "INSERT INTO sent (file_unique_id, dest_file_id, dest, sent_at) "
+        "VALUES (?, ?, ?, datetime('now'))",
+        (source_unique_id, dest_file_id, dest),
+    )
+    db.commit()
+    log.info(
+        "GIF %s/%s: cached source unique_id=%s -> destination file_id=%s",
+        message.chat.id, message.id, source_unique_id, dest_file_id,
+    )
+    return True
 
 
 async def send_to_dest(message: Message) -> bool:

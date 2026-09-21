@@ -46,13 +46,15 @@ class Mem:
     def __init__(s, status): s.status = status
 
 class Anim:
-    def __init__(s, fid="FID"): s.file_id = fid
+    def __init__(s, fid="FID", unique_id=None):
+        s.file_id = fid
+        s.file_unique_id = unique_id or fid
 
 class Msg:
-    def __init__(s, *, gid=-1001, from_id=5, self_=False, anim=True, protected=False, command=None, mid=42, fid="FID"):
+    def __init__(s, *, gid=-1001, from_id=5, self_=False, anim=True, protected=False, command=None, mid=42, fid="FID", unique_id=None):
         s.chat = Chat(gid, "supergroup")
         s.from_user = U(from_id, self_)
-        s.animation = Anim(fid) if anim else None
+        s.animation = Anim(fid, unique_id) if anim else None
         s.has_protected_content = protected
         s.command = command
         s.id = mid
@@ -63,9 +65,11 @@ client.me = me
 
 calls = []
 async def cached(cid, fid, *a, **k):
-    calls.append(("cached", cid, fid)); return types.SimpleNamespace(id=1)
+    calls.append(("cached", cid, fid)); return types.SimpleNamespace(
+        id=1, animation=Anim("DEST-" + fid, "DEST-UNIQUE"))
 async def animsend(cid, path, *a, **k):
-    calls.append(("anim", cid, path)); return types.SimpleNamespace(id=2)
+    calls.append(("anim", cid, path)); return types.SimpleNamespace(
+        id=2, animation=Anim("DEST-UPLOAD", "DEST-UPLOAD-UNIQUE"))
 async def dl(msg, file_name, in_memory):
     calls.append(("dl", file_name))
     p = os.path.join(os.path.dirname(file_name) or ".", "gif.mp4")
@@ -206,24 +210,24 @@ ok("gc_command: .gc load accepts n = 50000")
 client.send_cached_media = cached
 bot.state.update(dedup=True, dest=-2001)
 calls.clear()
-r1 = asyncio.run(bot.clone_media(Msg(fid="F9")))
+r1 = asyncio.run(bot.clone_media(Msg(fid="F9", unique_id="U9")))
 assert r1 is True and calls == [("cached", -2001, "F9")], (r1, calls)
 calls.clear()
-r2 = asyncio.run(bot.clone_media(Msg(fid="F9")))
+r2 = asyncio.run(bot.clone_media(Msg(fid="F9-new", unique_id="U9")))
 assert r2 is False and calls == [], (r2, calls)
 ok("dedup on: duplicate gif skipped, no second send")
-assert bot.db.execute("SELECT dest FROM sent WHERE file_id='F9'").fetchall() == [(-2001,)]
+assert bot.db.execute("SELECT dest_file_id, dest FROM sent WHERE file_unique_id='U9'").fetchall() == [("DEST-F9", -2001)]
 ok("dedup: sent gif recorded in sent.db")
 bot.state.update(dest=-2002)
 calls.clear()
-r3 = asyncio.run(bot.clone_media(Msg(fid="F9")))
+r3 = asyncio.run(bot.clone_media(Msg(fid="F9", unique_id="U9")))
 assert r3 is True and calls == [("cached", -2002, "F9")], (r3, calls)
 ok("dedup: dest-scoped, new dest allowed")
 bot.state.update(dest=-2002, dedup=False)
 calls.clear()
-r4 = asyncio.run(bot.clone_media(Msg(fid="F9")))
-assert r4 is True and calls == [("cached", -2002, "F9")], (r4, calls)
-assert bot.db.execute("SELECT COUNT(*) FROM sent WHERE file_id='F9' AND dest=-2002").fetchone() == (2,)
+r4 = asyncio.run(bot.clone_media(Msg(fid="F9", unique_id="U9")))
+assert r4 is True and calls == [("cached", -2002, "DEST-F9")], (r4, calls)
+assert bot.db.execute("SELECT COUNT(*) FROM sent WHERE file_unique_id='U9' AND dest=-2002").fetchone() == (1,)
 ok("dedup off: re-sends + still records in db")
 bot.state.update(dedup=True, dest=None)
 m8 = DMsg(5, ["gc", "dedup", "off"])
