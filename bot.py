@@ -394,40 +394,37 @@ async def on_group_message(app, message, *a):
 # ─────────────────────────── commands ───────────────────────────
 
 HELP_TEXT = (
-    f"+--------------------------------------------------------------+\n"
-    f"|                         GIFCENTER                            |\n"
-    f"+--------------------------------------------------------------+\n"
-    f"| WATCHING                                                     |\n"
-    f"|   {PREFIX}gc add <group_id>       Start watching a group       |\n"
-    f"|   {PREFIX}gc remove <group_id>    Stop watching a group        |\n"
-    f"|   {PREFIX}gc list                 Show groups and settings     |\n"
-    f"|   {PREFIX}gc dest <chat_id>       Set destination chat         |\n"
-    f"|   {PREFIX}gc load <group_id> <n>  Queue last n messages       |\n"
-    f"+--------------------------------------------------------------+\n"
-    f"| SENDING                                                      |\n"
-    f"|   {PREFIX}gc delay <seconds>      Set global send delay       |\n"
-    f"|   {PREFIX}gc dedup [on|off]       Toggle destination dedup    |\n"
-    f"|   {PREFIX}gc kw ...               Keyword-triggered GIF sends |\n"
-    f"|   {PREFIX}gc session              Export the session string   |\n"
-    f"+--------------------------------------------------------------+\n"
-    f"| KEYWORDS                                                     |\n"
-    f"|   {PREFIX}gc kw add exact <text>      Exact-match keyword     |\n"
-    f"|   {PREFIX}gc kw add contains <text>   Contains-match keyword  |\n"
-    f"|   {PREFIX}gc kw remove <text>         Remove a keyword       |\n"
-    f"|   {PREFIX}gc kw list                  Show keywords/settings  |\n"
-    f"|   {PREFIX}gc kw on|off                Enable/disable triggers |\n"
-    f"|   {PREFIX}gc kw all on|off            Everyone or whitelist  |\n"
-    f"|   {PREFIX}gc kw user add <id>         Add whitelisted user    |\n"
-    f"|   {PREFIX}gc kw user remove <id>      Remove whitelisted user |\n"
-    f"|   {PREFIX}gc kw user list             List whitelisted users  |\n"
-    f"|   {PREFIX}gc kw antispam ...          Configure GIF cooldown  |\n"
-    f"|   {PREFIX}gc kw antispam whitelist on|off                    |\n"
-    f"|   {PREFIX}gc kw help                  Show keyword help       |\n"
-    f"+--------------------------------------------------------------+\n"
-    f"| NOTES                                                        |\n"
-    f"|   All GIF sends use one FIFO queue, so delay applies globally.|\n"
-    f"|   Keyword replies bypass dedup and may reuse cached files.   |\n"
-    f"+--------------------------------------------------------------+"
+    f"*GIFCENTER* - GIF watcher/loader\n\n"
+    f"+--------------------------------------------------+\n"
+    f"| *WATCHING*                                       |\n"
+    f"|   `{PREFIX}gc add <group_id>`                    |\n"
+    f"|   `{PREFIX}gc remove <group_id>`                 |\n"
+    f"|   `{PREFIX}gc list`                              |\n"
+    f"|   `{PREFIX}gc dest <chat_id>`                    |\n"
+    f"|   `{PREFIX}gc load <group_id> <n>`               |\n"
+    f"+--------------------------------------------------+\n"
+    f"| *SENDING*                                        |\n"
+    f"|   `{PREFIX}gc delay <seconds>`                   |\n"
+    f"|   `{PREFIX}gc dedup <on|off>`                    |\n"
+    f"|   `{PREFIX}gc session`                           |\n"
+    f"|   `{PREFIX}gc status`                            |\n"
+    f"+--------------------------------------------------+\n"
+    f"| *KEYWORDS*                                       |\n"
+    f"|   `{PREFIX}gc kw`                                |\n"
+    f"|   `{PREFIX}gc kw add exact <text>`               |\n"
+    f"|   `{PREFIX}gc kw add contains <text>`            |\n"
+    f"|   `{PREFIX}gc kw remove <text>`                  |\n"
+    f"|   `{PREFIX}gc kw on|off`                         |\n"
+    f"|   `{PREFIX}gc kw all on|off`                     |\n"
+    f"|   `{PREFIX}gc kw user add|remove|list ...`       |\n"
+    f"|   `{PREFIX}gc kw antispam [on|off|<seconds>]`    |\n"
+    f"|   `{PREFIX}gc kw antispam whitelist on|off`      |\n"
+    f"|   `{PREFIX}gc kw help`                           |\n"
+    f"+--------------------------------------------------+\n"
+    f"| *NOTES*                                          |\n"
+    f"| o All GIF sends use one global FIFO queue.       |\n"
+    f"| o Keyword GIFs have a global file cooldown.      |\n"
+    f"+--------------------------------------------------+"
 )
 
 
@@ -445,7 +442,7 @@ async def _member_ok(chat_id: int, statuses) -> tuple[bool, str]:
 
 async def cmd_add(args, message) -> str:
     if len(args) < 2:
-        return "usage: .gc add <group_id>"
+        return f"usage: `{PREFIX}gc add <group_id>`"
     gid = _parse_chat_id(args[1])
     if gid is None:
         return "invalid chat id"
@@ -475,7 +472,7 @@ async def cmd_add(args, message) -> str:
 
 async def cmd_remove(args, message) -> str:
     if len(args) < 2:
-        return "usage: .gc remove <group_id>"
+        return f"usage: `{PREFIX}gc remove <group_id>`"
     gid = _parse_chat_id(args[1])
     if gid is None:
         return "invalid chat id"
@@ -512,7 +509,7 @@ async def cmd_list(args, message) -> str:
 
 async def cmd_dest(args, message) -> str:
     if len(args) < 2:
-        return "usage: .gc dest <chat_id>"
+        return f"usage: `{PREFIX}gc dest <chat_id>`"
     cid = _parse_chat_id(args[1])
     if cid is None:
         return "invalid chat id"
@@ -543,7 +540,7 @@ async def cmd_dest(args, message) -> str:
 
 async def cmd_load(args, message) -> str:
     if len(args) < 3:
-        return "usage: .gc load <group_id> <number>"
+        return f"usage: `{PREFIX}gc load <group_id> <number>`"
     gid = _parse_chat_id(args[1])
     if gid is None:
         return "invalid chat id"
@@ -581,9 +578,35 @@ async def cmd_load(args, message) -> str:
     return f"sent {sent} gif(s) from last {len(messages)} message(s)"
 
 
+async def cmd_status(args, message) -> str:
+    lines = [
+        "*gifcenter status*",
+        "",
+        f"- *Watching:* `{len(state['groups'])} group(s)`",
+        f"- *Destination:* `{'set' if state['dest'] is not None else 'not set'}`",
+        f"- *Send delay:* `{state['delay']}s`",
+        f"- *Destination dedup:* `{'on' if state['dedup'] else 'off'}`",
+        f"- *Keywords:* `{'on' if state['keywords_enabled'] else 'off'}`",
+        f"- *Keyword access:* `{'everyone' if state['keyword_allow_all'] else 'whitelist only'}`",
+        f"- *Exact keywords:* `{len(state['keywords_exact'])}`",
+        f"- *Contains keywords:* `{len(state['keywords_contains'])}`",
+        f"- *Whitelisted users:* `{len(state['keyword_users'])}`",
+        f"- *Keyword anti-spam:* `{'on' if state['keyword_antispam_enabled'] else 'off'}`",
+        f"- *Anti-spam cooldown:* `{state['keyword_antispam_seconds']}s`",
+        f"- *Whitelist cooldown:* `{'on' if state['keyword_antispam_whitelist'] else 'off'}`",
+    ]
+    if state["dest"] is not None:
+        try:
+            title = _chat_title(await client.get_chat(state["dest"]))
+            lines[3] = f"- *Destination:* `{title}` ({state['dest']})"
+        except Exception:
+            lines[3] = f"- *Destination:* `{state['dest']}` (unreachable)"
+    return "\n".join(lines)
+
+
 async def cmd_delay(args, message) -> str:
     if len(args) < 2:
-        return f"delay is {state['delay']}s. usage: .gc delay <seconds>"
+        return f"delay is `{state['delay']}s`. usage: `{PREFIX}gc delay <seconds>`"
     try:
         d = float(args[1])
     except ValueError:
@@ -597,10 +620,10 @@ async def cmd_delay(args, message) -> str:
 
 async def cmd_dedup(args, message) -> str:
     if len(args) < 2:
-        return f"dedup: {'on' if state['dedup'] else 'off'}. usage: .gc dedup <on|off>"
+        return f"dedup: {'on' if state['dedup'] else 'off'}. usage: `{PREFIX}gc dedup <on|off>`"
     v = args[1].lower()
     if v not in ("on", "off"):
-        return "dedup must be on or off"
+        return f"dedup must be on or off. usage: `{PREFIX}gc dedup <on|off>`"
     state["dedup"] = v == "on"
     save_state(state)
     return f"dedup: {v}"
@@ -608,23 +631,35 @@ async def cmd_dedup(args, message) -> str:
 
 async def cmd_kw(args, message) -> str:
     if len(args) < 2:
-        return ("kw: " + ("on" if state["keywords_enabled"] else "off") +
-                f"; everyone: {'on' if state['keyword_allow_all'] else 'off'}\n"
-                f"exact: {', '.join(state['keywords_exact']) or '(none)'}\n"
-                f"contains: {', '.join(state['keywords_contains']) or '(none)'}\n"
-                f"users: {', '.join(map(str, state['keyword_users'])) or '(none)'}\n"
-                "usage: .gc kw <add|list|remove|on|off|all|user> ...")
+        return (
+            "*keyword status*\n"
+            f"- *Triggers:* `{'on' if state['keywords_enabled'] else 'off'}`\n"
+            f"- *Access:* `{'everyone' if state['keyword_allow_all'] else 'whitelist only'}`\n"
+            f"- *Exact keywords:* `{len(state['keywords_exact'])}`\n"
+            f"- *Contains keywords:* `{len(state['keywords_contains'])}`\n"
+            f"- *Whitelisted users:* `{len(state['keyword_users'])}`\n"
+            f"- *Anti-spam:* `{'on' if state['keyword_antispam_enabled'] else 'off'}`\n"
+            f"- *Cooldown:* `{state['keyword_antispam_seconds']}s`\n"
+            f"- *Whitelist cooldown:* `{'on' if state['keyword_antispam_whitelist'] else 'off'}`"
+        )
     sub = args[1].casefold()
     if sub == "help":
-        return (".gc kw add exact <keyword>\n.gc kw add contains <keyword>\n"
-                ".gc kw list\n.gc kw remove <keyword>\n.gc kw on|off\n"
-                ".gc kw all on|off\n.gc kw antispam [on|off|<seconds>]\n.gc kw antispam whitelist on|off\n.gc kw user add <user_id>\n"
-                ".gc kw user remove <user_id>\n.gc kw user list")
+        return ("*keyword commands*\n"
+                f"`{PREFIX}gc kw add exact <keyword>`\n"
+                f"`{PREFIX}gc kw add contains <keyword>`\n"
+                f"`{PREFIX}gc kw list`\n"
+                f"`{PREFIX}gc kw remove <keyword>`\n"
+                f"`{PREFIX}gc kw on|off`\n"
+                f"`{PREFIX}gc kw all on|off`\n"
+                f"`{PREFIX}gc kw antispam [on|off|<seconds>]`\n"
+                f"`{PREFIX}gc kw antispam whitelist on|off`\n"
+                f"`{PREFIX}gc kw user add|remove|list <user_id>`")
+
     if sub == "antispam":
         if len(args) >= 4 and args[2].casefold() == "whitelist":
             value = args[3].casefold()
             if value not in ("on", "off"):
-                return "usage: .gc kw antispam whitelist <on|off>"
+                return f"usage: `{PREFIX}gc kw antispam whitelist <on|off>`"
             state["keyword_antispam_whitelist"] = value == "on"
             save_state(state)
             return f"keyword anti-spam for whitelisted users: {value}"
@@ -652,17 +687,17 @@ async def cmd_kw(args, message) -> str:
         return f"keywords: {sub}"
     if sub == "all":
         if len(args) < 3 or args[2].casefold() not in ("on", "off"):
-            return "usage: .gc kw all <on|off>"
+            return f"usage: `{PREFIX}gc kw all <on|off>`"
         state["keyword_allow_all"] = args[2].casefold() == "on"
         save_state(state)
         return f"keyword everyone: {args[2].casefold()}"
     if sub == "add":
         if len(args) < 4 or args[2].casefold() not in ("exact", "contains"):
-            return "usage: .gc kw add <exact|contains> <keyword>"
+            return f"usage: `{PREFIX}gc kw add <exact|contains> <keyword>`"
         match_type = args[2].casefold()
         keyword = " ".join(args[3:]).strip().casefold()
         if not keyword:
-            return "usage: .gc kw add <exact|contains> <keyword>"
+            return f"usage: `{PREFIX}gc kw add <exact|contains> <keyword>`"
         key = "keywords_exact" if match_type == "exact" else "keywords_contains"
         if keyword in state[key]:
             return "keyword already exists"
@@ -672,7 +707,7 @@ async def cmd_kw(args, message) -> str:
     if sub == "remove":
         keyword = " ".join(args[2:]).strip().casefold()
         if not keyword:
-            return "usage: .gc kw remove <keyword>"
+            return f"usage: `{PREFIX}gc kw remove <keyword>`"
         removed = False
         for key in ("keywords_exact", "keywords_contains"):
             if keyword in state[key]:
@@ -684,25 +719,27 @@ async def cmd_kw(args, message) -> str:
         return f"keyword removed: {keyword}"
     if sub == "list":
         lines = [
-            f"keywords: {'on' if state['keywords_enabled'] else 'off'}",
-            f"everyone: {'on' if state['keyword_allow_all'] else 'off'}",
-            f"anti-spam: {'on' if state['keyword_antispam_enabled'] else 'off'}",
-            f"cooldown: {state['keyword_antispam_seconds']}s",
-            f"whitelisted users limited: {'on' if state['keyword_antispam_whitelist'] else 'off'}",
+            "*keyword config*",
+            f"- *Triggers:* `{'on' if state['keywords_enabled'] else 'off'}`",
+            f"- *Access:* `{'everyone' if state['keyword_allow_all'] else 'whitelist only'}`",
+            f"- *Anti-spam:* `{'on' if state['keyword_antispam_enabled'] else 'off'}`",
+            f"- *Cooldown:* `{state['keyword_antispam_seconds']}s`",
+            f"- *Whitelist cooldown:* `{'on' if state['keyword_antispam_whitelist'] else 'off'}`",
+            "",
+            "*exact:*",
         ]
-        lines.append("exact:")
-        lines.extend(f"• {k}" for k in state["keywords_exact"] or ["(none)"])
-        lines.append("contains:")
-        lines.extend(f"• {k}" for k in state["keywords_contains"] or ["(none)"])
+        lines.extend(f"  o `{k}`" for k in state["keywords_exact"] or ["(none)"])
+        lines.append("*contains:*")
+        lines.extend(f"  o `{k}`" for k in state["keywords_contains"] or ["(none)"])
         return "\n".join(lines)
     if sub == "user":
         if len(args) < 3 or args[2].casefold() not in ("add", "remove", "list"):
-            return "usage: .gc kw user <add|remove|list> [user_id]"
+            return f"usage: `{PREFIX}gc kw user <add|remove|list> [user_id]`"
         action = args[2].casefold()
         if action == "list":
             return "\n".join(map(str, state["keyword_users"])) or "(none)"
         if len(args) < 4:
-            return f"usage: .gc kw user {action} <user_id>"
+            return f"usage: `{PREFIX}gc kw user {action} <user_id>`"
         try:
             uid = int(args[3])
         except ValueError:
@@ -717,7 +754,7 @@ async def cmd_kw(args, message) -> str:
         state["keyword_users"].remove(uid)
         save_state(state)
         return f"keyword user removed: {uid}"
-    return "unknown kw subcommand; use .gc kw help"
+    return f"unknown kw subcommand; use `{PREFIX}gc kw help`"
 
 
 async def cmd_session(args, message) -> str:
@@ -752,12 +789,14 @@ async def gc_command(app, message: Message, *a):
             text = await cmd_delay(args, message)
         elif cmd == "dedup":
             text = await cmd_dedup(args, message)
+        elif cmd == "status":
+            text = await cmd_status(args, message)
         elif cmd == "kw":
             text = await cmd_kw(args, message)
         elif cmd == "session":
             text = await cmd_session(args, message)
         else:
-            text = f"unknown subcommand {cmd!r}\n\n{HELP_TEXT}"
+            text = f"unknown subcommand `{cmd}`\n\n{HELP_TEXT}"
     except errors.FloodWait as e:
         text = f"floodwait: try again in {e.seconds}s"
     except Exception as e:

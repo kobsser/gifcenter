@@ -261,7 +261,7 @@ assert bot.state["dedup"] is False and bot.load_state()["dedup"] is False, bot.s
 ok("gc_command: owner .gc dedup off toggles + persists")
 m9 = DMsg(5, ["gc", "dedup", "maybe"])
 asyncio.run(bot.gc_command(None, m9))
-assert m9.edits == ["dedup must be on or off"], m9.edits
+assert m9.edits == ["dedup must be on or off. usage: `.gc dedup <on|off>`"], m9.edits
 assert bot.state["dedup"] is False
 ok("gc_command: .gc dedup maybe rejected, state unchanged")
 m10 = DMsg(5, ["gc", "dedup"])
@@ -290,8 +290,16 @@ assert bot.state["keyword_users"] == [123] and not bot.state["keyword_allow_all"
 ok("gc_command: keyword add/on/allowlist config")
 m = DMsg(5, ["gc", "kw", "list"])
 asyncio.run(bot.gc_command(None, m))
-assert "• again" in m.edits[0] and "• please again" in m.edits[0] and "everyone: off" in m.edits[0]
+assert "`again`" in m.edits[0] and "`please again`" in m.edits[0] and "Access:* `whitelist only`" in m.edits[0]
 ok("gc_command: keyword list")
+m = DMsg(5, ["gc", "kw"])
+asyncio.run(bot.gc_command(None, m))
+assert "keyword status" in m.edits[0] and "Anti-spam:" in m.edits[0] and "Whitelist cooldown:" in m.edits[0], m.edits
+ok("gc_command: kw alone shows full keyword status")
+m = DMsg(5, ["gc", "status"])
+asyncio.run(bot.gc_command(None, m))
+assert "gifcenter status" in m.edits[0] and "Send delay:" in m.edits[0] and "Keyword anti-spam:" in m.edits[0], m.edits
+ok("gc_command: status shows global configuration")
 
 # ── keyword reply trigger ──
 client.send_cached_media = cached
