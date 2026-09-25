@@ -395,36 +395,28 @@ async def on_group_message(app, message, *a):
 
 HELP_TEXT = (
     f"*GIFCENTER* - GIF watcher/loader\n\n"
-    f"+--------------------------------------------------+\n"
-    f"| *WATCHING*                                       |\n"
-    f"|   `{PREFIX}gc add <group_id>`                    |\n"
-    f"|   `{PREFIX}gc remove <group_id>`                 |\n"
-    f"|   `{PREFIX}gc list`                              |\n"
-    f"|   `{PREFIX}gc dest <chat_id>`                    |\n"
-    f"|   `{PREFIX}gc load <group_id> <n>`               |\n"
-    f"+--------------------------------------------------+\n"
-    f"| *SENDING*                                        |\n"
-    f"|   `{PREFIX}gc delay <seconds>`                   |\n"
-    f"|   `{PREFIX}gc dedup <on|off>`                    |\n"
-    f"|   `{PREFIX}gc session`                           |\n"
-    f"|   `{PREFIX}gc status`                            |\n"
-    f"+--------------------------------------------------+\n"
-    f"| *KEYWORDS*                                       |\n"
-    f"|   `{PREFIX}gc kw`                                |\n"
-    f"|   `{PREFIX}gc kw add exact <text>`               |\n"
-    f"|   `{PREFIX}gc kw add contains <text>`            |\n"
-    f"|   `{PREFIX}gc kw remove <text>`                  |\n"
-    f"|   `{PREFIX}gc kw on|off`                         |\n"
-    f"|   `{PREFIX}gc kw all on|off`                     |\n"
-    f"|   `{PREFIX}gc kw user add|remove|list ...`       |\n"
-    f"|   `{PREFIX}gc kw antispam [on|off|<seconds>]`    |\n"
-    f"|   `{PREFIX}gc kw antispam whitelist on|off`      |\n"
-    f"|   `{PREFIX}gc kw help`                           |\n"
-    f"+--------------------------------------------------+\n"
-    f"| *NOTES*                                          |\n"
-    f"| o All GIF sends use one global FIFO queue.       |\n"
-    f"| o Keyword GIFs have a global file cooldown.      |\n"
-    f"+--------------------------------------------------+"
+    f"*Watching*\n"
+    f"`{PREFIX}gc add <group_id>` - add a group\n"
+    f"`{PREFIX}gc remove <group_id>` - remove a group\n"
+    f"`{PREFIX}gc list` - list groups\n"
+    f"`{PREFIX}gc dest <chat_id>` - set destination\n"
+    f"`{PREFIX}gc load <group_id> <n>` - load messages\n\n"
+    f"*Sending*\n"
+    f"`{PREFIX}gc delay <seconds>` - set send delay\n"
+    f"`{PREFIX}gc dedup <on|off>` - toggle destination dedup\n"
+    f"`{PREFIX}gc session` - export session string\n"
+    f"`{PREFIX}gc status` - show all status\n\n"
+    f"*Keywords*\n"
+    f"`{PREFIX}gc kw` - show keyword status\n"
+    f"`{PREFIX}gc kw add exact <text>` - add exact keyword\n"
+    f"`{PREFIX}gc kw add contains <text>` - add contains keyword\n"
+    f"`{PREFIX}gc kw remove <text>` - remove keyword\n"
+    f"`{PREFIX}gc kw on|off` - toggle keyword triggers\n"
+    f"`{PREFIX}gc kw all on|off` - allow everyone or whitelist\n"
+    f"`{PREFIX}gc kw user add|remove|list ...` - manage users\n"
+    f"`{PREFIX}gc kw antispam [on|off|<seconds>]` - set cooldown\n"
+    f"`{PREFIX}gc kw antispam whitelist on|off` - limit whitelist too\n"
+    f"`{PREFIX}gc kw help` - show keyword help"
 )
 
 
@@ -803,7 +795,7 @@ async def gc_command(app, message: Message, *a):
         log.exception("gc command failed")
         text = f"error: {type(e).__name__}: {e}"
     try:
-        await message.edit_text(text)
+        await message.edit_text(text, parse_mode=enums.ParseMode.MARKDOWN)
     except errors.MessageNotModified:
         pass  # identical result already in the message
 

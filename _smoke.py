@@ -157,8 +157,9 @@ class DMsg:
         s.replies, s.edits = [], []
     async def reply_text(s, text):
         s.replies.append(text)
-    async def edit_text(s, text):
+    async def edit_text(s, text, **kwargs):
         s.edits.append(text)
+        s.edit_parse_mode = kwargs.get("parse_mode")
 
 bot.state.update(groups=[], dest=None, delay=2.0)
 m1 = DMsg(999, ["gc", "delay", "1.5"])
