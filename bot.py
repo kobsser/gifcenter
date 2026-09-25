@@ -13,6 +13,7 @@ import logging
 import os
 import sqlite3
 import tempfile
+import time
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -57,6 +58,7 @@ DEFAULT_STATE = {
     "groups": [], "dest": None, "delay": 2.0, "dedup": True,
     "keywords_exact": [], "keywords_contains": [],
     "keywords_enabled": False, "keyword_allow_all": False, "keyword_users": [],
+    "keyword_antispam_enabled": True, "keyword_antispam_seconds": 300.0,
 }
 
 
@@ -70,6 +72,8 @@ def load_state() -> dict:
         state.setdefault(key, default)
     state["groups"] = [int(g) for g in state["groups"]]
     state["delay"] = float(state["delay"])
+    state["keyword_antispam_enabled"] = bool(state["keyword_antispam_enabled"])
+    state["keyword_antispam_seconds"] = float(state["keyword_antispam_seconds"])
     legacy_keywords = state.pop("keywords", [])
     state["keywords_exact"] = [str(k).casefold() for k in state["keywords_exact"] if str(k).strip()]
     state["keywords_contains"] = [str(k).casefold() for k in state["keywords_contains"] if str(k).strip()]
@@ -130,7 +134,33 @@ db.execute("DROP INDEX IF EXISTS sent_ix")
 db.execute("DROP INDEX IF EXISTS sent_dest_unique_ix")
 db.execute("CREATE INDEX sent_ix ON sent (file_unique_id, dest)")
 db.execute("CREATE INDEX sent_dest_unique_ix ON sent (dest_file_unique_id, dest)")
+db.execute(
+    "CREATE TABLE IF NOT EXISTS keyword_antispam ("
+    "file_unique_id TEXT PRIMARY KEY, expires_at REAL NOT NULL)"
+)
 db.commit()
+
+
+def try_reserve_keyword_antispam(file_unique_id: str) -> tuple[bool, float]:
+    if not state["keyword_antispam_enabled"]:
+        return True, 0.0
+    now = time.time()
+    db.execute("DELETE FROM keyword_antispam WHERE expires_at <= ?", (now,))
+    row = db.execute("SELECT expires_at FROM keyword_antispam WHERE file_unique_id = ?", (file_unique_id,)).fetchone()
+    if row is not None and row[0] > now:
+        db.commit()
+        return False, row[0] - now
+    db.execute(
+        "INSERT OR REPLACE INTO keyword_antispam (file_unique_id, expires_at) VALUES (?, ?)",
+        (file_unique_id, now + state["keyword_antispam_seconds"]),
+    )
+    db.commit()
+    return True, 0.0
+
+
+def release_keyword_antispam(file_unique_id: str) -> None:
+    db.execute("DELETE FROM keyword_antispam WHERE file_unique_id = ?", (file_unique_id,))
+    db.commit()
 
 # ─────────────────────────── send core ───────────────────────────
 
@@ -343,8 +373,16 @@ async def on_group_message(app, message, *a):
     replied = getattr(message, "reply_to_message", None)
     if replied is None or replied.animation is None:
         return
-    log.info("keyword %r triggered GIF %s/%s by user %s", keyword, replied.chat.id, replied.id, message.from_user.id)
-    await send_to_dest_with_force(replied)
+    file_unique_id = replied.animation.file_unique_id
+    reserved, remaining = try_reserve_keyword_antispam(file_unique_id)
+    if not reserved:
+        log.info("keyword %r ignored: GIF unique_id=%s is on anti-spam cooldown for %.1fs", keyword, file_unique_id, remaining)
+        return
+    log.info("keyword %r accepted for GIF unique_id=%s by user %s; cooldown=%ss", keyword, file_unique_id, message.from_user.id, state["keyword_antispam_seconds"])
+    ok = await send_to_dest_with_force(replied)
+    if not ok:
+        release_keyword_antispam(file_unique_id)
+        log.info("keyword GIF unique_id=%s send failed; anti-spam reservation released", file_unique_id)
 
 
 # ─────────────────────────── commands ───────────────────────────
@@ -369,6 +407,7 @@ HELP_TEXT = (
     f"  {PREFIX}gc kw remove <text>      Remove a keyword\n"
     f"  {PREFIX}gc kw list               List keywords and current access mode\n"
     f"  {PREFIX}gc kw on|off             Enable/disable keyword triggers\n"
+    f"  {PREFIX}gc kw antispam [on|off|<seconds>]  Configure keyword GIF anti-spam cooldown\n"
     f"  {PREFIX}gc kw all on|off         Allow everyone or whitelist only\n"
     f"  {PREFIX}gc kw user add <id>      Add a user to the keyword whitelist\n"
     f"  {PREFIX}gc kw user remove <id>   Remove a user from the whitelist\n"
@@ -567,8 +606,25 @@ async def cmd_kw(args, message) -> str:
     if sub == "help":
         return (".gc kw add exact <keyword>\n.gc kw add contains <keyword>\n"
                 ".gc kw list\n.gc kw remove <keyword>\n.gc kw on|off\n"
-                ".gc kw all on|off\n.gc kw user add <user_id>\n"
+                ".gc kw all on|off\n.gc kw antispam [on|off|<seconds>]\n.gc kw user add <user_id>\n"
                 ".gc kw user remove <user_id>\n.gc kw user list")
+    if sub == "antispam":
+        if len(args) < 3:
+            return f"keyword anti-spam: {'on' if state['keyword_antispam_enabled'] else 'off'}\ncooldown: {state['keyword_antispam_seconds']}s"
+        value = args[2].casefold()
+        if value in ("on", "off"):
+            state["keyword_antispam_enabled"] = value == "on"
+            save_state(state)
+            return f"keyword anti-spam: {value}"
+        try:
+            seconds = float(args[2])
+        except ValueError:
+            return "cooldown must be on, off, or a number of seconds"
+        if not 1 <= seconds <= 86400:
+            return "cooldown must be 1..86400 seconds"
+        state["keyword_antispam_seconds"] = seconds
+        save_state(state)
+        return f"keyword anti-spam cooldown: {seconds}s"
     if sub in ("on", "off"):
         state["keywords_enabled"] = sub == "on"
         save_state(state)
@@ -609,6 +665,8 @@ async def cmd_kw(args, message) -> str:
         lines = [
             f"keywords: {'on' if state['keywords_enabled'] else 'off'}",
             f"everyone: {'on' if state['keyword_allow_all'] else 'off'}",
+            f"anti-spam: {'on' if state['keyword_antispam_enabled'] else 'off'}",
+            f"cooldown: {state['keyword_antispam_seconds']}s",
         ]
         lines.append("exact:")
         lines.extend(f"• {k}" for k in state["keywords_exact"] or ["(none)"])

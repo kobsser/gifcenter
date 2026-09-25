@@ -26,7 +26,8 @@ bot.save_state(bot.state)
 reloaded = bot.load_state()
 assert reloaded == {"groups": [-1001, -1002], "dest": -2001, "delay": 1.5, "dedup": True,
                        "keywords_exact": [], "keywords_contains": [], "keywords_enabled": False,
-                       "keyword_allow_all": False, "keyword_users": []}, reloaded
+                       "keyword_allow_all": False, "keyword_users": [],
+                       "keyword_antispam_enabled": True, "keyword_antispam_seconds": 300.0}, reloaded
 ok("state save/load round-trip")
 
 # load_state on missing file -> defaults
@@ -34,7 +35,8 @@ os.remove(bot.STATE_FILE)
 d = bot.load_state()
 assert d == {"groups": [], "dest": None, "delay": 2.0, "dedup": True,
              "keywords_exact": [], "keywords_contains": [], "keywords_enabled": False,
-             "keyword_allow_all": False, "keyword_users": []}, d
+             "keyword_allow_all": False, "keyword_users": [],
+             "keyword_antispam_enabled": True, "keyword_antispam_seconds": 300.0}, d
 ok("load_state defaults on missing file")
 
 # ── fakes ──
@@ -309,8 +311,15 @@ contains_reply.text = "please again now"
 contains_reply.reply_to_message = source
 calls.clear()
 asyncio.run(bot.on_group_message(None, contains_reply))
-assert calls == [("cached", -2001, "DEST-KW-SOURCE")], calls
-ok("keyword reply: contains keyword re-sends GIF")
+assert calls == [], calls
+ok("keyword anti-spam: same GIF blocked across keyword messages")
+
+other_source = Msg(gid=-1001, from_id=77, fid="KW-SOURCE-2", unique_id="KW-U-2", mid=904)
+contains_reply.reply_to_message = other_source
+calls.clear()
+asyncio.run(bot.on_group_message(None, contains_reply))
+assert calls == [("cached", -2001, "KW-SOURCE-2")], calls
+ok("keyword anti-spam: different GIF is allowed")
 
 blocked = Msg(gid=-1001, from_id=456, anim=False, mid=902)
 blocked.text = "again"
@@ -321,10 +330,96 @@ assert calls == [], calls
 ok("keyword reply: non-whitelisted user blocked")
 
 bot.state["keyword_allow_all"] = True
+blocked.reply_to_message = source
 calls.clear()
 asyncio.run(bot.on_group_message(None, blocked))
-assert calls == [("cached", -2001, "DEST-KW-SOURCE")], calls
+assert calls == [], calls
+ok("keyword anti-spam: cooldown is shared across users")
+
+all_source = Msg(gid=-1001, from_id=77, fid="KW-ALL", unique_id="KW-ALL-U", mid=909)
+blocked.reply_to_message = all_source
+calls.clear()
+asyncio.run(bot.on_group_message(None, blocked))
+assert calls == [("cached", -2001, "KW-ALL")], calls
 ok("keyword reply: everyone toggle allows all users")
+
+# Same GIF cooldown is independent of user/chat/message and expires normally.
+bot.state["keyword_antispam_seconds"] = 1.0
+source2 = Msg(gid=-1001, from_id=77, fid="KW-TEMP", unique_id="KW-TEMP-U", mid=905)
+reply2 = Msg(gid=-1001, from_id=123, anim=False, mid=906)
+reply2.text = "again"
+reply2.reply_to_message = source2
+calls.clear()
+asyncio.run(bot.on_group_message(None, reply2))
+assert calls == [("cached", -2001, "KW-TEMP")], calls
+calls.clear()
+asyncio.run(bot.on_group_message(None, reply2))
+assert calls == [], calls
+import time as _time
+_time.sleep(1.05)
+calls.clear()
+asyncio.run(bot.on_group_message(None, reply2))
+assert calls == [("cached", -2001, "DEST-KW-TEMP")], calls
+ok("keyword anti-spam: cooldown expires by GIF unique_id")
+
+# Turning anti-spam off permits repeated keyword sends. Re-enabling honors active reservations.
+bot.state["keyword_antispam_seconds"] = 300.0
+bot.state["keyword_antispam_enabled"] = False
+calls.clear()
+asyncio.run(bot.on_group_message(None, reply2))
+assert calls == [("cached", -2001, "DEST-KW-TEMP")], calls
+ok("keyword anti-spam: off allows repeated sends")
+bot.state["keyword_antispam_enabled"] = True
+
+# A failed queued send releases the reservation.
+orig_send_force = bot.send_to_dest_with_force
+async def fail_send(_message):
+    return False
+bot.send_to_dest_with_force = fail_send
+failed_source = Msg(gid=-1001, from_id=77, fid="KW-FAIL", unique_id="KW-FAIL-U", mid=907)
+failed_reply = Msg(gid=-1001, from_id=123, anim=False, mid=908)
+failed_reply.text = "again"
+failed_reply.reply_to_message = failed_source
+asyncio.run(bot.on_group_message(None, failed_reply))
+assert bot.db.execute("SELECT 1 FROM keyword_antispam WHERE file_unique_id='KW-FAIL-U'").fetchone() is None
+bot.send_to_dest_with_force = orig_send_force
+ok("keyword anti-spam: failed send releases reservation")
+
+# Command configuration and persistence.
+for cmd, expected in [
+    (["gc", "kw", "antispam"], "keyword anti-spam: on\ncooldown: 300.0s"),
+    (["gc", "kw", "antispam", "600"], "keyword anti-spam cooldown: 600.0s"),
+    (["gc", "kw", "antispam", "off"], "keyword anti-spam: off"),
+    (["gc", "kw", "antispam", "on"], "keyword anti-spam: on"),
+]:
+    m = DMsg(5, cmd)
+    asyncio.run(bot.gc_command(None, m))
+    assert m.edits == [expected], (cmd, m.edits)
+assert bot.load_state()["keyword_antispam_seconds"] == 600.0
+for cmd in (["gc", "kw", "antispam", "0"], ["gc", "kw", "antispam", "86401"], ["gc", "kw", "antispam", "nope"]):
+    m = DMsg(5, cmd)
+    asyncio.run(bot.gc_command(None, m))
+    assert m.edits and m.edits[0].startswith(("cooldown must be 1..86400", "cooldown must be on, off, or a number")), (cmd, m.edits)
+ok("gc_command: invalid anti-spam cooldown rejected")
+
+# Reservation is synchronous/atomic within the single-process SQLite userbot.
+bot.state["keyword_antispam_enabled"] = True
+bot.state["keyword_antispam_seconds"] = 300.0
+bot.db.execute("DELETE FROM keyword_antispam")
+bot.db.commit()
+async def reserve_many():
+    return await asyncio.gather(*[asyncio.sleep(0, result=bot.try_reserve_keyword_antispam("KW-CONCURRENT")) for _ in range(8)])
+results = asyncio.run(reserve_many())
+assert sum(ok for ok, _ in results) == 1, results
+ok("keyword anti-spam: concurrent reservations allow exactly one")
+
+# Non-keyword send paths never create anti-spam reservations.
+bot.db.execute("DELETE FROM keyword_antispam")
+bot.db.commit()
+client.send_cached_media = cached
+asyncio.run(bot.clone_media(Msg(fid="NON-KW", unique_id="NON-KW-U"), force=True))
+assert bot.db.execute("SELECT 1 FROM keyword_antispam WHERE file_unique_id='NON-KW-U'").fetchone() is None
+ok("keyword anti-spam: watcher/load/forced clone path does not reserve")
 
 # ── global send queue ──
 # All entry points use the same queue, so concurrent sends are serialized and
