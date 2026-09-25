@@ -27,7 +27,7 @@ reloaded = bot.load_state()
 assert reloaded == {"groups": [-1001, -1002], "dest": -2001, "delay": 1.5, "dedup": True,
                        "keywords_exact": [], "keywords_contains": [], "keywords_enabled": False,
                        "keyword_allow_all": False, "keyword_users": [],
-                       "keyword_antispam_enabled": True, "keyword_antispam_seconds": 300.0}, reloaded
+                       "keyword_antispam_enabled": True, "keyword_antispam_seconds": 300.0, "keyword_antispam_whitelist": True}, reloaded
 ok("state save/load round-trip")
 
 # load_state on missing file -> defaults
@@ -36,7 +36,7 @@ d = bot.load_state()
 assert d == {"groups": [], "dest": None, "delay": 2.0, "dedup": True,
              "keywords_exact": [], "keywords_contains": [], "keywords_enabled": False,
              "keyword_allow_all": False, "keyword_users": [],
-             "keyword_antispam_enabled": True, "keyword_antispam_seconds": 300.0}, d
+             "keyword_antispam_enabled": True, "keyword_antispam_seconds": 300.0, "keyword_antispam_whitelist": True}, d
 ok("load_state defaults on missing file")
 
 # ── fakes ──
@@ -314,6 +314,18 @@ asyncio.run(bot.on_group_message(None, contains_reply))
 assert calls == [], calls
 ok("keyword anti-spam: same GIF blocked across keyword messages")
 
+# Whitelisted users can optionally bypass the GIF cooldown. The bypass is
+# specific to users in the whitelist; everyone else remains rate-limited.
+bot.state["keyword_antispam_whitelist"] = False
+whitelist_bypass_reply = Msg(gid=-1001, from_id=123, anim=False, mid=910)
+whitelist_bypass_reply.text = "again"
+whitelist_bypass_reply.reply_to_message = source
+calls.clear()
+asyncio.run(bot.on_group_message(None, whitelist_bypass_reply))
+assert calls == [("cached", -2001, "DEST-KW-SOURCE")], calls
+ok("keyword anti-spam: whitelisted user bypasses cooldown when disabled")
+bot.state["keyword_antispam_whitelist"] = True
+
 other_source = Msg(gid=-1001, from_id=77, fid="KW-SOURCE-2", unique_id="KW-U-2", mid=904)
 contains_reply.reply_to_message = other_source
 calls.clear()
@@ -387,7 +399,10 @@ ok("keyword anti-spam: failed send releases reservation")
 
 # Command configuration and persistence.
 for cmd, expected in [
-    (["gc", "kw", "antispam"], "keyword anti-spam: on\ncooldown: 300.0s"),
+    (["gc", "kw", "antispam"], "keyword anti-spam: on\ncooldown: 300.0s\nwhitelisted users limited: on"),
+    (["gc", "kw", "antispam", "whitelist", "off"], "keyword anti-spam for whitelisted users: off"),
+    (["gc", "kw", "antispam"], "keyword anti-spam: on\ncooldown: 300.0s\nwhitelisted users limited: off"),
+    (["gc", "kw", "antispam", "whitelist", "on"], "keyword anti-spam for whitelisted users: on"),
     (["gc", "kw", "antispam", "600"], "keyword anti-spam cooldown: 600.0s"),
     (["gc", "kw", "antispam", "off"], "keyword anti-spam: off"),
     (["gc", "kw", "antispam", "on"], "keyword anti-spam: on"),

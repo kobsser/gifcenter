@@ -59,6 +59,7 @@ DEFAULT_STATE = {
     "keywords_exact": [], "keywords_contains": [],
     "keywords_enabled": False, "keyword_allow_all": False, "keyword_users": [],
     "keyword_antispam_enabled": True, "keyword_antispam_seconds": 300.0,
+    "keyword_antispam_whitelist": True,
 }
 
 
@@ -74,6 +75,7 @@ def load_state() -> dict:
     state["delay"] = float(state["delay"])
     state["keyword_antispam_enabled"] = bool(state["keyword_antispam_enabled"])
     state["keyword_antispam_seconds"] = float(state["keyword_antispam_seconds"])
+    state["keyword_antispam_whitelist"] = bool(state["keyword_antispam_whitelist"])
     legacy_keywords = state.pop("keywords", [])
     state["keywords_exact"] = [str(k).casefold() for k in state["keywords_exact"] if str(k).strip()]
     state["keywords_contains"] = [str(k).casefold() for k in state["keywords_contains"] if str(k).strip()]
@@ -374,13 +376,17 @@ async def on_group_message(app, message, *a):
     if replied is None or replied.animation is None:
         return
     file_unique_id = replied.animation.file_unique_id
-    reserved, remaining = try_reserve_keyword_antispam(file_unique_id)
-    if not reserved:
-        log.info("keyword %r ignored: GIF unique_id=%s is on anti-spam cooldown for %.1fs", keyword, file_unique_id, remaining)
-        return
-    log.info("keyword %r accepted for GIF unique_id=%s by user %s; cooldown=%ss", keyword, file_unique_id, message.from_user.id, state["keyword_antispam_seconds"])
+    is_whitelisted = message.from_user.id in state["keyword_users"]
+    if is_whitelisted and not state["keyword_antispam_whitelist"]:
+        log.info("keyword %r accepted for whitelisted user %s: anti-spam bypassed for GIF unique_id=%s", keyword, message.from_user.id, file_unique_id)
+    else:
+        reserved, remaining = try_reserve_keyword_antispam(file_unique_id)
+        if not reserved:
+            log.info("keyword %r ignored: GIF unique_id=%s is on anti-spam cooldown for %.1fs", keyword, file_unique_id, remaining)
+            return
+        log.info("keyword %r accepted for GIF unique_id=%s by user %s; cooldown=%ss", keyword, file_unique_id, message.from_user.id, state["keyword_antispam_seconds"])
     ok = await send_to_dest_with_force(replied)
-    if not ok:
+    if not ok and not (is_whitelisted and not state["keyword_antispam_whitelist"]):
         release_keyword_antispam(file_unique_id)
         log.info("keyword GIF unique_id=%s send failed; anti-spam reservation released", file_unique_id)
 
@@ -408,6 +414,7 @@ HELP_TEXT = (
     f"  {PREFIX}gc kw list               List keywords and current access mode\n"
     f"  {PREFIX}gc kw on|off             Enable/disable keyword triggers\n"
     f"  {PREFIX}gc kw antispam [on|off|<seconds>]  Configure keyword GIF anti-spam cooldown\n"
+    f"  {PREFIX}gc kw antispam whitelist on|off  Apply anti-spam to whitelisted users too\n"
     f"  {PREFIX}gc kw all on|off         Allow everyone or whitelist only\n"
     f"  {PREFIX}gc kw user add <id>      Add a user to the keyword whitelist\n"
     f"  {PREFIX}gc kw user remove <id>   Remove a user from the whitelist\n"
@@ -606,11 +613,20 @@ async def cmd_kw(args, message) -> str:
     if sub == "help":
         return (".gc kw add exact <keyword>\n.gc kw add contains <keyword>\n"
                 ".gc kw list\n.gc kw remove <keyword>\n.gc kw on|off\n"
-                ".gc kw all on|off\n.gc kw antispam [on|off|<seconds>]\n.gc kw user add <user_id>\n"
+                ".gc kw all on|off\n.gc kw antispam [on|off|<seconds>]\n.gc kw antispam whitelist on|off\n.gc kw user add <user_id>\n"
                 ".gc kw user remove <user_id>\n.gc kw user list")
     if sub == "antispam":
+        if len(args) >= 4 and args[2].casefold() == "whitelist":
+            value = args[3].casefold()
+            if value not in ("on", "off"):
+                return "usage: .gc kw antispam whitelist <on|off>"
+            state["keyword_antispam_whitelist"] = value == "on"
+            save_state(state)
+            return f"keyword anti-spam for whitelisted users: {value}"
         if len(args) < 3:
-            return f"keyword anti-spam: {'on' if state['keyword_antispam_enabled'] else 'off'}\ncooldown: {state['keyword_antispam_seconds']}s"
+            return (f"keyword anti-spam: {'on' if state['keyword_antispam_enabled'] else 'off'}\n"
+                    f"cooldown: {state['keyword_antispam_seconds']}s\n"
+                    f"whitelisted users limited: {'on' if state['keyword_antispam_whitelist'] else 'off'}")
         value = args[2].casefold()
         if value in ("on", "off"):
             state["keyword_antispam_enabled"] = value == "on"
@@ -667,6 +683,7 @@ async def cmd_kw(args, message) -> str:
             f"everyone: {'on' if state['keyword_allow_all'] else 'off'}",
             f"anti-spam: {'on' if state['keyword_antispam_enabled'] else 'off'}",
             f"cooldown: {state['keyword_antispam_seconds']}s",
+            f"whitelisted users limited: {'on' if state['keyword_antispam_whitelist'] else 'off'}",
         ]
         lines.append("exact:")
         lines.extend(f"• {k}" for k in state["keywords_exact"] or ["(none)"])
