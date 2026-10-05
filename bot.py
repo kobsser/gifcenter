@@ -485,7 +485,7 @@ async def on_group_message(app, message, *a):
         log.info("keyword reply skipped for GIF unique_id=%s: cooldown %.1fs remaining", file_unique_id, remaining)
         return
     try:
-        link = await client.export_message_link(state["dest"], result.id)
+        link = getattr(result, "link", None)
         if not link:
             raise RuntimeError("Telegram returned no destination message link")
         reply = await _queue_keyword_reply(message, link)

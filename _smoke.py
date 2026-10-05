@@ -29,7 +29,7 @@ assert reloaded == {"groups": [-1001, -1002], "dest": -2001, "delay": 1.5, "dedu
                        "keyword_allow_all": False, "keyword_users": [],
                        "keyword_antispam_enabled": True, "keyword_antispam_seconds": 300.0, "keyword_antispam_whitelist": True,
                        "keyword_reply_enabled": False, "keyword_reply_delete_seconds": 60.0,
-                       "keyword_reply_cooldown_seconds": 300.0}, reloaded
+                       "keyword_reply_cooldown_seconds": 300.0, "keyword_reply_delay_seconds": 1.0}, reloaded
 ok("state save/load round-trip")
 
 # load_state on missing file -> defaults
@@ -40,7 +40,7 @@ assert d == {"groups": [], "dest": None, "delay": 2.0, "dedup": True,
              "keyword_allow_all": False, "keyword_users": [],
              "keyword_antispam_enabled": True, "keyword_antispam_seconds": 300.0, "keyword_antispam_whitelist": True,
              "keyword_reply_enabled": False, "keyword_reply_delete_seconds": 60.0,
-             "keyword_reply_cooldown_seconds": 300.0}, d
+             "keyword_reply_cooldown_seconds": 300.0, "keyword_reply_delay_seconds": 1.0}, d
 ok("load_state defaults on missing file")
 
 # ── fakes ──
@@ -86,10 +86,12 @@ client.me = me
 calls = []
 async def cached(cid, fid, *a, **k):
     calls.append(("cached", cid, fid)); return types.SimpleNamespace(
-        id=1, animation=Anim("DEST-" + fid, "DEST-UNIQUE"))
+        id=1, chat=Chat(cid), link=f"https://t.me/c/{abs(cid) - 1000000000000}/1",
+        animation=Anim("DEST-" + fid, "DEST-UNIQUE"))
 async def animsend(cid, path, *a, **k):
     calls.append(("anim", cid, path)); return types.SimpleNamespace(
-        id=2, animation=Anim("DEST-UPLOAD", "DEST-UPLOAD-UNIQUE"))
+        id=2, chat=Chat(cid), link=f"https://t.me/c/{abs(cid) - 1000000000000}/2",
+        animation=Anim("DEST-UPLOAD", "DEST-UPLOAD-UNIQUE"))
 async def dl(msg, file_name, in_memory):
     calls.append(("dl", file_name))
     p = os.path.join(os.path.dirname(file_name) or ".", "gif.mp4")
@@ -98,9 +100,6 @@ async def dl(msg, file_name, in_memory):
 client.send_cached_media = cached
 client.send_animation = animsend
 client.download_media = dl
-async def export_message_link(chat_id, message_id, *a, **k):
-    return f"https://t.me/c/{abs(chat_id) - 1000000000000}/{message_id}"
-client.export_message_link = export_message_link
 
 # ── clone unprotected -> cached file_id ──
 bot.state.update(dest=-2001)
@@ -355,6 +354,7 @@ assert calls == [("cached", -2001, "DEST-KW-LINK")], calls
 assert not getattr(second_link_trigger, "sent_replies", []), getattr(second_link_trigger, "sent_replies", [])
 ok("exact keyword: link reply cooldown is shared across users")
 
+bot.state["keyword_antispam_enabled"] = True
 contains_reply = Msg(gid=-1001, from_id=123, anim=False, mid=903)
 contains_reply.text = "please again now"
 contains_reply.reply_to_message = source
@@ -434,7 +434,7 @@ bot.state["keyword_antispam_enabled"] = True
 
 # A failed queued send releases the reservation.
 orig_send_force = bot.send_to_dest_with_force
-async def fail_send(_message):
+async def fail_send(_message, **_kwargs):
     return False
 bot.send_to_dest_with_force = fail_send
 failed_source = Msg(gid=-1001, from_id=77, fid="KW-FAIL", unique_id="KW-FAIL-U", mid=907)
@@ -504,7 +504,7 @@ orig_clone_media = bot.clone_media
 queue_events = []
 
 
-async def fake_clone(message, *, force=False):
+async def fake_clone(message, *, force=False, return_message=False):
     queue_events.append(("send", message.id, force, asyncio.get_running_loop().time()))
     return True
 
