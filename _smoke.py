@@ -339,9 +339,9 @@ asyncio.run(bot.on_group_message(None, reply))
 assert calls == [("cached", -2001, "KW-SOURCE")], calls
 ok("keyword reply: exact keyword re-sends GIF")
 
-# Exact-keyword link replies are configurable, persist a global per-GIF cooldown,
-# and do not apply to contains keywords.
-bot.state.update(keyword_reply_enabled=True, keyword_reply_delete_seconds=1.0, keyword_reply_cooldown_seconds=1.0, keyword_antispam_enabled=False)
+# Keyword link replies are configurable, persist a global per-GIF cooldown,
+# and apply to both exact and contains keywords.
+bot.state.update(keyword_reply_enabled=True, keyword_reply_contains_enabled=True, keyword_reply_delete_seconds=1.0, keyword_reply_cooldown_seconds=1.0, keyword_antispam_enabled=False)
 bot.state["keyword_allow_all"] = True
 bot.db.execute("DELETE FROM keyword_reply_cooldown")
 bot.db.commit()
@@ -356,6 +356,19 @@ assert calls == [
     ("reply", -1001, "https://t.me/c/-999999997999/1", 921),
 ], calls
 ok("exact keyword: sends destination post link as reply")
+
+# Contains-keyword link replies use the same reply path.
+contains_link_source = Msg(gid=-1001, from_id=77, fid="KW-CONTAINS-LINK", unique_id="KW-CONTAINS-LINK-U", mid=924)
+contains_link_trigger = Msg(gid=-1001, from_id=123, anim=False, mid=923)
+contains_link_trigger.text = "please again now"
+contains_link_trigger.reply_to_message = contains_link_source
+calls.clear()
+asyncio.run(bot.on_group_message(None, contains_link_trigger))
+assert calls == [
+    ("cached", -2001, "KW-CONTAINS-LINK"),
+    ("reply", -1001, "https://t.me/c/-999999997999/2", 923),
+], calls
+ok("contains keyword: sends destination post link as reply")
 
 second_link_trigger = Msg(gid=-1001, from_id=456, anim=False, mid=922)
 second_link_trigger.text = "again"
@@ -474,6 +487,10 @@ for cmd, expected in [
 assert bot.load_state()["keyword_antispam_seconds"] == 600.0
 for cmd, expected in [
     (["gc", "kw", "reply", "on"], "exact-keyword link replies: on"),
+    (["gc", "kw", "reply", "contains", "on"], "contains-keyword link replies: on"),
+    (["gc", "kw", "reply", "contains", "off"], "contains-keyword link replies: off"),
+    (["gc", "kw", "reply", "contains", "on"], "contains-keyword link replies: on"),
+    (["gc", "kw", "reply", "delete", "0"], "link reply delete delay: 0.0s"),
     (["gc", "kw", "reply", "delete", "2m"], "link reply delete delay: 120.0s"),
     (["gc", "kw", "reply", "cooldown", "10s"], "link reply cooldown: 10.0s"),
 ]:
