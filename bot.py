@@ -60,6 +60,8 @@ DEFAULT_STATE = {
     "keywords_enabled": False, "keyword_allow_all": False, "keyword_users": [],
     "keyword_antispam_enabled": True, "keyword_antispam_seconds": 300.0,
     "keyword_antispam_whitelist": True,
+    "keyword_reply_enabled": False, "keyword_reply_delete_seconds": 60.0,
+    "keyword_reply_cooldown_seconds": 300.0, "keyword_reply_delay_seconds": 1.0,
 }
 
 
@@ -76,6 +78,10 @@ def load_state() -> dict:
     state["keyword_antispam_enabled"] = bool(state["keyword_antispam_enabled"])
     state["keyword_antispam_seconds"] = float(state["keyword_antispam_seconds"])
     state["keyword_antispam_whitelist"] = bool(state["keyword_antispam_whitelist"])
+    state["keyword_reply_enabled"] = bool(state["keyword_reply_enabled"])
+    state["keyword_reply_delete_seconds"] = float(state["keyword_reply_delete_seconds"])
+    state["keyword_reply_cooldown_seconds"] = float(state["keyword_reply_cooldown_seconds"])
+    state["keyword_reply_delay_seconds"] = float(state["keyword_reply_delay_seconds"])
     legacy_keywords = state.pop("keywords", [])
     state["keywords_exact"] = [str(k).casefold() for k in state["keywords_exact"] if str(k).strip()]
     state["keywords_contains"] = [str(k).casefold() for k in state["keywords_contains"] if str(k).strip()]
@@ -164,6 +170,30 @@ def release_keyword_antispam(file_unique_id: str) -> None:
     db.execute("DELETE FROM keyword_antispam WHERE file_unique_id = ?", (file_unique_id,))
     db.commit()
 
+
+db.execute(
+    "CREATE TABLE IF NOT EXISTS keyword_reply_cooldown ("
+    "file_unique_id TEXT PRIMARY KEY, expires_at REAL NOT NULL)"
+)
+db.commit()
+
+
+def try_reserve_keyword_reply(file_unique_id: str) -> tuple[bool, float]:
+    if state["keyword_reply_cooldown_seconds"] <= 0:
+        return True, 0.0
+    now = time.time()
+    db.execute("DELETE FROM keyword_reply_cooldown WHERE expires_at <= ?", (now,))
+    row = db.execute("SELECT expires_at FROM keyword_reply_cooldown WHERE file_unique_id = ?", (file_unique_id,)).fetchone()
+    if row is not None and row[0] > now:
+        db.commit(); return False, row[0] - now
+    db.execute("INSERT OR REPLACE INTO keyword_reply_cooldown (file_unique_id, expires_at) VALUES (?, ?)", (file_unique_id, now + state["keyword_reply_cooldown_seconds"]))
+    db.commit(); return True, 0.0
+
+
+def release_keyword_reply(file_unique_id: str) -> None:
+    db.execute("DELETE FROM keyword_reply_cooldown WHERE file_unique_id = ?", (file_unique_id,))
+    db.commit()
+
 # ─────────────────────────── send core ───────────────────────────
 
 FRIENDLY_ERRORS = {
@@ -190,7 +220,7 @@ async def send_with_flood_retry(fn: str, *args, tries: int = 5):
     return None
 
 
-async def clone_media(message: Message, *, force: bool = False):
+async def clone_media(message: Message, *, force: bool = False, return_message: bool = False):
     """Clone one GIF message to the destination chat.
 
     file_unique_id identifies the source GIF for deduplication.  The
@@ -228,7 +258,8 @@ async def clone_media(message: Message, *, force: bool = False):
             message.chat.id, message.id, "keyword trigger" if force else "dedup off", cached[0], source_unique_id,
         )
         try:
-            return await send_with_flood_retry("send_cached_media", dest, cached[0]) is not None
+            sent_message = await send_with_flood_retry("send_cached_media", dest, cached[0])
+            return sent_message if return_message else sent_message is not None
         except errors.RPCError:
             log.warning(
                 "GIF %s/%s: cached destination file_id=%s failed; "
@@ -287,7 +318,7 @@ async def clone_media(message: Message, *, force: bool = False):
             "not caching the result",
             message.chat.id, message.id,
         )
-        return True
+        return sent_message if return_message else True
 
     db.execute(
         "INSERT INTO sent (file_unique_id, dest_file_id, dest_file_unique_id, dest, sent_at) "
@@ -300,17 +331,18 @@ async def clone_media(message: Message, *, force: bool = False):
         "destination unique_id=%s",
         message.chat.id, message.id, source_unique_id, dest_file_id, dest_unique_id,
     )
-    return True
+    return sent_message if return_message else True
 
 
 async def _send_worker(queue: asyncio.Queue) -> None:
     """Process every GIF send in one FIFO stream and enforce the global delay."""
     while True:
-        message, force, result = await queue.get()
+        message, force, return_message, result = await queue.get()
         try:
-            ok = await clone_media(message, force=force)
+            result_value = await clone_media(message, force=force, return_message=return_message)
+            ok = result_value is not False and result_value is not None
             if not result.done():
-                result.set_result(ok)
+                result.set_result(result_value)
             if ok:
                 await asyncio.sleep(state["delay"])
         except Exception as e:
@@ -330,12 +362,12 @@ def _ensure_send_worker() -> None:
         send_worker_task = asyncio.create_task(_send_worker(send_queue))
 
 
-async def _queue_send(message: Message, *, force: bool = False) -> bool:
+async def _queue_send(message: Message, *, force: bool = False, return_message: bool = False):
     _ensure_send_worker()
     loop = asyncio.get_running_loop()
     result = loop.create_future()
     assert send_queue is not None
-    await send_queue.put((message, force, result))
+    await send_queue.put((message, force, return_message, result))
     return await result
 
 
@@ -343,8 +375,58 @@ async def send_to_dest(message: Message) -> bool:
     return await _queue_send(message)
 
 
-async def send_to_dest_with_force(message: Message) -> bool:
-    return await _queue_send(message, force=True)
+async def send_to_dest_with_force(message: Message, *, return_message: bool = False):
+    return await _queue_send(message, force=True, return_message=return_message)
+
+
+keyword_reply_queue: asyncio.Queue | None = None
+keyword_reply_queue_loop = None
+keyword_reply_worker_task: asyncio.Task | None = None
+
+
+async def _keyword_reply_worker(queue: asyncio.Queue) -> None:
+    """Send keyword link replies FIFO with a global anti-spam delay."""
+    while True:
+        message, link, result = await queue.get()
+        try:
+            reply = await message.reply_text(link, quote=True)
+            if not result.done():
+                result.set_result(reply)
+            await asyncio.sleep(state["keyword_reply_delay_seconds"])
+        except Exception as e:
+            log.exception("queued keyword link reply failed")
+            if not result.done():
+                result.set_exception(e)
+        finally:
+            queue.task_done()
+
+
+def _ensure_keyword_reply_worker() -> None:
+    global keyword_reply_queue, keyword_reply_queue_loop, keyword_reply_worker_task
+    loop = asyncio.get_running_loop()
+    if keyword_reply_worker_task is None or keyword_reply_worker_task.done() or keyword_reply_queue_loop is not loop:
+        keyword_reply_queue = asyncio.Queue()
+        keyword_reply_queue_loop = loop
+        keyword_reply_worker_task = asyncio.create_task(_keyword_reply_worker(keyword_reply_queue))
+
+
+async def _queue_keyword_reply(message: Message, link: str):
+    _ensure_keyword_reply_worker()
+    loop = asyncio.get_running_loop()
+    result = loop.create_future()
+    assert keyword_reply_queue is not None
+    await keyword_reply_queue.put((message, link, result))
+    return await result
+
+
+async def _delete_keyword_reply_later(reply: Message) -> None:
+    await asyncio.sleep(state["keyword_reply_delete_seconds"])
+    try:
+        await reply.delete()
+    except errors.RPCError as e:
+        log.info("keyword link reply %s could not be deleted: %s", reply.id, e)
+    except Exception:
+        log.exception("failed to delete keyword link reply %s", reply.id)
 
 
 # ─────────────────────────── live listener ───────────────────────────
@@ -385,10 +467,33 @@ async def on_group_message(app, message, *a):
             log.info("keyword %r ignored: GIF unique_id=%s is on anti-spam cooldown for %.1fs", keyword, file_unique_id, remaining)
             return
         log.info("keyword %r accepted for GIF unique_id=%s by user %s; cooldown=%ss", keyword, file_unique_id, message.from_user.id, state["keyword_antispam_seconds"])
-    ok = await send_to_dest_with_force(replied)
+    result = await send_to_dest_with_force(
+        replied,
+        return_message=(exact is not None and state["keyword_reply_enabled"]),
+    )
+    ok = result is not False and result is not None
     if not ok and not (is_whitelisted and not state["keyword_antispam_whitelist"]):
         release_keyword_antispam(file_unique_id)
         log.info("keyword GIF unique_id=%s send failed; anti-spam reservation released", file_unique_id)
+        return
+
+    if exact is None or not state["keyword_reply_enabled"]:
+        return
+
+    reserved_reply, remaining = try_reserve_keyword_reply(file_unique_id)
+    if not reserved_reply:
+        log.info("keyword reply skipped for GIF unique_id=%s: cooldown %.1fs remaining", file_unique_id, remaining)
+        return
+    try:
+        link = await client.export_message_link(state["dest"], result.id)
+        if not link:
+            raise RuntimeError("Telegram returned no destination message link")
+        reply = await _queue_keyword_reply(message, link)
+        log.info("keyword exact reply sent: GIF unique_id=%s -> %s", file_unique_id, link)
+        asyncio.create_task(_delete_keyword_reply_later(reply))
+    except Exception:
+        release_keyword_reply(file_unique_id)
+        log.exception("failed to send keyword GIF link reply for unique_id=%s", file_unique_id)
 
 
 # ─────────────────────────── commands ───────────────────────────
@@ -416,6 +521,10 @@ HELP_TEXT = (
     f"`{PREFIX}gc kw user add|remove|list ...` - manage users\n"
     f"`{PREFIX}gc kw antispam [on|off|<seconds>]` - set cooldown\n"
     f"`{PREFIX}gc kw antispam whitelist on|off` - limit whitelist too\n"
+    f"`{PREFIX}gc kw reply on|off` - toggle exact-keyword link replies\n"
+    f"`{PREFIX}gc kw reply delete <s|m>` - set link reply delete delay\n"
+    f"`{PREFIX}gc kw reply cooldown <s|m>` - set link reply cooldown\n"
+    f"`{PREFIX}gc kw reply delay <s|m>` - set link reply queue delay\n"
     f"`{PREFIX}gc kw help` - show keyword help"
 )
 
@@ -586,6 +695,10 @@ async def cmd_status(args, message) -> str:
         f"- *Keyword anti-spam:* `{'on' if state['keyword_antispam_enabled'] else 'off'}`",
         f"- *Anti-spam cooldown:* `{state['keyword_antispam_seconds']}s`",
         f"- *Whitelist cooldown:* `{'on' if state['keyword_antispam_whitelist'] else 'off'}`",
+        f"- *Exact-keyword link replies:* `{'on' if state['keyword_reply_enabled'] else 'off'}`",
+        f"- *Link reply delete delay:* `{state['keyword_reply_delete_seconds']}s`",
+        f"- *Link reply cooldown:* `{state['keyword_reply_cooldown_seconds']}s`",
+        f"- *Link reply queue delay:* `{state['keyword_reply_delay_seconds']}s`",
     ]
     if state["dest"] is not None:
         try:
@@ -632,7 +745,11 @@ async def cmd_kw(args, message) -> str:
             f"- *Whitelisted users:* `{len(state['keyword_users'])}`\n"
             f"- *Anti-spam:* `{'on' if state['keyword_antispam_enabled'] else 'off'}`\n"
             f"- *Cooldown:* `{state['keyword_antispam_seconds']}s`\n"
-            f"- *Whitelist cooldown:* `{'on' if state['keyword_antispam_whitelist'] else 'off'}`"
+            f"- *Whitelist cooldown:* `{'on' if state['keyword_antispam_whitelist'] else 'off'}`\n"
+            f"- *Exact-keyword link replies:* `{'on' if state['keyword_reply_enabled'] else 'off'}`\n"
+            f"- *Link reply delete delay:* `{state['keyword_reply_delete_seconds']}s`\n"
+            f"- *Link reply cooldown:* `{state['keyword_reply_cooldown_seconds']}s`\n"
+            f"- *Link reply queue delay:* `{state['keyword_reply_delay_seconds']}s`"
         )
     sub = args[1].casefold()
     if sub == "help":
@@ -645,8 +762,52 @@ async def cmd_kw(args, message) -> str:
                 f"`{PREFIX}gc kw all on|off`\n"
                 f"`{PREFIX}gc kw antispam [on|off|<seconds>]`\n"
                 f"`{PREFIX}gc kw antispam whitelist on|off`\n"
+                f"`{PREFIX}gc kw reply on|off`\n"
+                f"`{PREFIX}gc kw reply delete <s|m>`\n"
+                f"`{PREFIX}gc kw reply cooldown <s|m>`\n"
+                f"`{PREFIX}gc kw reply delay <s|m>`\n"
                 f"`{PREFIX}gc kw user add|remove|list <user_id>`")
 
+    if sub == "reply":
+        if len(args) < 3:
+            return (f"exact-keyword link replies: {'on' if state['keyword_reply_enabled'] else 'off'}\n"
+                    f"delete delay: {state['keyword_reply_delete_seconds']}s\n"
+                    f"cooldown: {state['keyword_reply_cooldown_seconds']}s\n"
+                    f"queue delay: {state['keyword_reply_delay_seconds']}s")
+        action = args[2].casefold()
+        if action in ("on", "off"):
+            state["keyword_reply_enabled"] = action == "on"
+            save_state(state)
+            return f"exact-keyword link replies: {action}"
+        if action in ("delete", "cooldown", "delay"):
+            if len(args) < 4:
+                return f"usage: `{PREFIX}gc kw reply {action} <s|m>`"
+            raw = args[3].casefold()
+            try:
+                if raw.endswith("s"):
+                    seconds = float(raw[:-1])
+                elif raw.endswith("m"):
+                    seconds = float(raw[:-1]) * 60
+                else:
+                    return f"usage: `{PREFIX}gc kw reply {action} <s|m>`"
+            except ValueError:
+                return f"usage: `{PREFIX}gc kw reply {action} <s|m>`"
+            if seconds <= 0 or seconds > 86400:
+                return "reply time must be greater than 0 and at most 24h"
+            key = {
+                "delete": "keyword_reply_delete_seconds",
+                "cooldown": "keyword_reply_cooldown_seconds",
+                "delay": "keyword_reply_delay_seconds",
+            }[action]
+            state[key] = seconds
+            save_state(state)
+            labels = {
+                "delete": "link reply delete delay",
+                "cooldown": "link reply cooldown",
+                "delay": "link reply queue delay",
+            }
+            return f"{labels[action]}: {seconds}s"
+        return f"unknown reply option; use `{PREFIX}gc kw reply on|off|delete|cooldown|delay`"
     if sub == "antispam":
         if len(args) >= 4 and args[2].casefold() == "whitelist":
             value = args[3].casefold()

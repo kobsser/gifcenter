@@ -27,7 +27,9 @@ reloaded = bot.load_state()
 assert reloaded == {"groups": [-1001, -1002], "dest": -2001, "delay": 1.5, "dedup": True,
                        "keywords_exact": [], "keywords_contains": [], "keywords_enabled": False,
                        "keyword_allow_all": False, "keyword_users": [],
-                       "keyword_antispam_enabled": True, "keyword_antispam_seconds": 300.0, "keyword_antispam_whitelist": True}, reloaded
+                       "keyword_antispam_enabled": True, "keyword_antispam_seconds": 300.0, "keyword_antispam_whitelist": True,
+                       "keyword_reply_enabled": False, "keyword_reply_delete_seconds": 60.0,
+                       "keyword_reply_cooldown_seconds": 300.0}, reloaded
 ok("state save/load round-trip")
 
 # load_state on missing file -> defaults
@@ -36,7 +38,9 @@ d = bot.load_state()
 assert d == {"groups": [], "dest": None, "delay": 2.0, "dedup": True,
              "keywords_exact": [], "keywords_contains": [], "keywords_enabled": False,
              "keyword_allow_all": False, "keyword_users": [],
-             "keyword_antispam_enabled": True, "keyword_antispam_seconds": 300.0, "keyword_antispam_whitelist": True}, d
+             "keyword_antispam_enabled": True, "keyword_antispam_seconds": 300.0, "keyword_antispam_whitelist": True,
+             "keyword_reply_enabled": False, "keyword_reply_delete_seconds": 60.0,
+             "keyword_reply_cooldown_seconds": 300.0}, d
 ok("load_state defaults on missing file")
 
 # ── fakes ──
@@ -66,6 +70,14 @@ class Msg:
         s.id = mid
         s.text = None
         s.reply_to_message = None
+    async def reply_text(s, text, quote=True):
+        s.sent_replies = getattr(s, "sent_replies", [])
+        reply = types.SimpleNamespace(id=700 + len(s.sent_replies), text=text, deleted=False)
+        async def delete():
+            reply.deleted = True
+        reply.delete = delete
+        s.sent_replies.append(text)
+        return reply
 
 client = bot.client
 me = U(5, self_=True)
@@ -86,6 +98,9 @@ async def dl(msg, file_name, in_memory):
 client.send_cached_media = cached
 client.send_animation = animsend
 client.download_media = dl
+async def export_message_link(chat_id, message_id, *a, **k):
+    return f"https://t.me/c/{abs(chat_id) - 1000000000000}/{message_id}"
+client.export_message_link = export_message_link
 
 # ── clone unprotected -> cached file_id ──
 bot.state.update(dest=-2001)
@@ -315,6 +330,31 @@ asyncio.run(bot.on_group_message(None, reply))
 assert calls == [("cached", -2001, "KW-SOURCE")], calls
 ok("keyword reply: exact keyword re-sends GIF")
 
+# Exact-keyword link replies are configurable, persist a global per-GIF cooldown,
+# and do not apply to contains keywords.
+bot.state.update(keyword_reply_enabled=True, keyword_reply_delete_seconds=1.0, keyword_reply_cooldown_seconds=1.0, keyword_antispam_enabled=False)
+bot.state["keyword_allow_all"] = True
+bot.db.execute("DELETE FROM keyword_reply_cooldown")
+bot.db.commit()
+reply_source = Msg(gid=-1001, from_id=77, fid="KW-LINK", unique_id="KW-LINK-U", mid=920)
+link_trigger = Msg(gid=-1001, from_id=123, anim=False, mid=921)
+link_trigger.text = "again"
+link_trigger.reply_to_message = reply_source
+calls.clear()
+asyncio.run(bot.on_group_message(None, link_trigger))
+assert calls == [("cached", -2001, "KW-LINK")], calls
+assert link_trigger.sent_replies == ["https://t.me/c/-999999997999/1"], link_trigger.sent_replies
+ok("exact keyword: sends destination post link as reply")
+
+second_link_trigger = Msg(gid=-1001, from_id=456, anim=False, mid=922)
+second_link_trigger.text = "again"
+second_link_trigger.reply_to_message = reply_source
+calls.clear()
+asyncio.run(bot.on_group_message(None, second_link_trigger))
+assert calls == [("cached", -2001, "DEST-KW-LINK")], calls
+assert not getattr(second_link_trigger, "sent_replies", []), getattr(second_link_trigger, "sent_replies", [])
+ok("exact keyword: link reply cooldown is shared across users")
+
 contains_reply = Msg(gid=-1001, from_id=123, anim=False, mid=903)
 contains_reply.text = "please again now"
 contains_reply.reply_to_message = source
@@ -420,6 +460,18 @@ for cmd, expected in [
     asyncio.run(bot.gc_command(None, m))
     assert m.edits == [expected], (cmd, m.edits)
 assert bot.load_state()["keyword_antispam_seconds"] == 600.0
+for cmd, expected in [
+    (["gc", "kw", "reply", "on"], "exact-keyword link replies: on"),
+    (["gc", "kw", "reply", "delete", "2m"], "link reply delete delay: 120.0s"),
+    (["gc", "kw", "reply", "cooldown", "10s"], "link reply cooldown: 10.0s"),
+]:
+    m = DMsg(5, cmd)
+    asyncio.run(bot.gc_command(None, m))
+    assert m.edits == [expected], (cmd, m.edits)
+assert bot.state["keyword_reply_enabled"] is True
+assert bot.state["keyword_reply_delete_seconds"] == 120.0
+assert bot.state["keyword_reply_cooldown_seconds"] == 10.0
+ok("gc_command: keyword link reply toggle and s/m delays")
 for cmd in (["gc", "kw", "antispam", "0"], ["gc", "kw", "antispam", "86401"], ["gc", "kw", "antispam", "nope"]):
     m = DMsg(5, cmd)
     asyncio.run(bot.gc_command(None, m))
