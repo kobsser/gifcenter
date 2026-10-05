@@ -70,8 +70,9 @@ class Msg:
         s.id = mid
         s.text = None
         s.reply_to_message = None
-    async def reply_text(s, text, quote=True):
+    async def reply_text(s, text, **kwargs):
         s.sent_replies = getattr(s, "sent_replies", [])
+        s.reply_kwargs = kwargs
         reply = types.SimpleNamespace(id=700 + len(s.sent_replies), text=text, deleted=False)
         async def delete():
             reply.deleted = True
@@ -97,8 +98,17 @@ async def dl(msg, file_name, in_memory):
     p = os.path.join(os.path.dirname(file_name) or ".", "gif.mp4")
     open(p, "w").write("x")
     return p
+async def send_message(chat_id, text, reply_to_message_id=None, **kwargs):
+    calls.append(("reply", chat_id, text, reply_to_message_id))
+    reply = types.SimpleNamespace(id=700 + len([c for c in calls if c[0] == "reply"]), text=text, deleted=False)
+    async def delete():
+        reply.deleted = True
+    reply.delete = delete
+    return reply
+
 client.send_cached_media = cached
 client.send_animation = animsend
+client.send_message = send_message
 client.download_media = dl
 
 # ── clone unprotected -> cached file_id ──
@@ -341,8 +351,10 @@ link_trigger.text = "again"
 link_trigger.reply_to_message = reply_source
 calls.clear()
 asyncio.run(bot.on_group_message(None, link_trigger))
-assert calls == [("cached", -2001, "KW-LINK")], calls
-assert link_trigger.sent_replies == ["https://t.me/c/-999999997999/1"], link_trigger.sent_replies
+assert calls == [
+    ("cached", -2001, "KW-LINK"),
+    ("reply", -1001, "https://t.me/c/-999999997999/1", 921),
+], calls
 ok("exact keyword: sends destination post link as reply")
 
 second_link_trigger = Msg(gid=-1001, from_id=456, anim=False, mid=922)
@@ -351,10 +363,10 @@ second_link_trigger.reply_to_message = reply_source
 calls.clear()
 asyncio.run(bot.on_group_message(None, second_link_trigger))
 assert calls == [("cached", -2001, "DEST-KW-LINK")], calls
-assert not getattr(second_link_trigger, "sent_replies", []), getattr(second_link_trigger, "sent_replies", [])
 ok("exact keyword: link reply cooldown is shared across users")
 
 bot.state["keyword_antispam_enabled"] = True
+bot.state["keyword_reply_enabled"] = False
 contains_reply = Msg(gid=-1001, from_id=123, anim=False, mid=903)
 contains_reply.text = "please again now"
 contains_reply.reply_to_message = source

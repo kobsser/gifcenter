@@ -389,7 +389,11 @@ async def _keyword_reply_worker(queue: asyncio.Queue) -> None:
     while True:
         message, link, result = await queue.get()
         try:
-            reply = await message.reply_text(link, quote=True)
+            reply = await client.send_message(
+                chat_id=message.chat.id,
+                text=link,
+                reply_to_message_id=message.id,
+            )
             if not result.done():
                 result.set_result(reply)
             await asyncio.sleep(state["keyword_reply_delay_seconds"])
