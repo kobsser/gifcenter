@@ -127,7 +127,7 @@ db = sqlite3.connect(str(SENT_DB))
 db.execute(
     "CREATE TABLE IF NOT EXISTS sent ("
     "file_unique_id TEXT, dest_file_id TEXT, dest_file_unique_id TEXT, "
-    "dest_message_id INTEGER, dest_message_link TEXT, dest INTEGER NOT NULL, sent_at TEXT NOT NULL)"
+    "dest_message_id INTEGER, dest INTEGER NOT NULL, sent_at TEXT NOT NULL)"
 )
 # Migrate the old schema. Older versions had a NOT NULL `file_id` column,
 # which cannot accept the new INSERT shape. Those old file_id values were the
@@ -140,7 +140,7 @@ if "file_id" in columns:
     db.execute(
         "CREATE TABLE sent_new ("
         "file_unique_id TEXT, dest_file_id TEXT, dest_file_unique_id TEXT, "
-        "dest_message_id INTEGER, dest_message_link TEXT, dest INTEGER NOT NULL, sent_at TEXT NOT NULL)"
+        "dest_message_id INTEGER, dest INTEGER NOT NULL, sent_at TEXT NOT NULL)"
     )
     db.execute("DROP TABLE sent")
     db.execute("ALTER TABLE sent_new RENAME TO sent")
@@ -153,8 +153,13 @@ if "dest_file_unique_id" not in columns:
     db.execute("ALTER TABLE sent ADD COLUMN dest_file_unique_id TEXT")
 if "dest_message_id" not in columns:
     db.execute("ALTER TABLE sent ADD COLUMN dest_message_id INTEGER")
-if "dest_message_link" not in columns:
-    db.execute("ALTER TABLE sent ADD COLUMN dest_message_link TEXT")
+if "dest_message_link" in columns:
+    db.execute("DROP TABLE IF EXISTS sent_new")
+    db.execute("CREATE TABLE sent_new (file_unique_id TEXT, dest_file_id TEXT, dest_file_unique_id TEXT, dest_message_id INTEGER, dest INTEGER NOT NULL, sent_at TEXT NOT NULL)")
+    db.execute("INSERT INTO sent_new SELECT file_unique_id, dest_file_id, dest_file_unique_id, dest_message_id, dest, sent_at FROM sent")
+    db.execute("DROP TABLE sent")
+    db.execute("ALTER TABLE sent_new RENAME TO sent")
+    columns = {row[1]: row for row in db.execute("PRAGMA table_info(sent)")}
 db.execute("DROP INDEX IF EXISTS sent_ix")
 db.execute("DROP INDEX IF EXISTS sent_dest_unique_ix")
 db.execute("CREATE INDEX sent_ix ON sent (file_unique_id, dest)")
@@ -279,9 +284,9 @@ async def clone_media(message: Message, *, force: bool = False, return_message: 
             if sent_message is not None:
                 dest_message_id = getattr(sent_message, "id", None)
                 db.execute(
-                    "UPDATE sent SET dest_message_id = ?, dest_message_link = ?, sent_at = datetime('now') "
+                    "UPDATE sent SET dest_message_id = ?, sent_at = datetime('now') "
                     "WHERE rowid = (SELECT rowid FROM sent WHERE dest_file_id = ? AND dest = ? ORDER BY rowid DESC LIMIT 1)",
-                    (dest_message_id, getattr(sent_message, "link", None), cached[0], dest),
+                    (dest_message_id, cached[0], dest),
                 )
                 db.commit()
             return sent_message if return_message else sent_message is not None
@@ -346,9 +351,9 @@ async def clone_media(message: Message, *, force: bool = False, return_message: 
         return sent_message if return_message else True
 
     db.execute(
-        "INSERT INTO sent (file_unique_id, dest_file_id, dest_file_unique_id, dest_message_id, dest_message_link, dest, sent_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, datetime('now'))",
-        (source_unique_id, dest_file_id, dest_unique_id, getattr(sent_message, "id", None), getattr(sent_message, "link", None), dest),
+        "INSERT INTO sent (file_unique_id, dest_file_id, dest_file_unique_id, dest_message_id, dest, sent_at) "
+        "VALUES (?, ?, ?, ?, ?, datetime('now'))",
+        (source_unique_id, dest_file_id, dest_unique_id, getattr(sent_message, "id", None), dest),
     )
     db.commit()
     log.info(
@@ -455,19 +460,27 @@ async def _queue_keyword_reply(message: Message, value: str, *, mode: str = "lin
     return await result
 
 
+def _destination_message_link(dest: int, message_id: int) -> str | None:
+    if dest is None or message_id is None:
+        return None
+    chat_id = int(dest)
+    internal_id = -chat_id - 1000000000000 if chat_id <= -1000000000000 else -chat_id
+    return f"https://t.me/c/{internal_id}/{int(message_id)}"
+
+
 async def _saved_destination_link(file_unique_id: str, fallback=None) -> str | None:
     row = db.execute(
-        "SELECT rowid, dest, dest_message_id, dest_message_link, dest_file_id FROM sent "
+        "SELECT rowid, dest, dest_message_id, dest_file_id FROM sent "
         "WHERE file_unique_id = ? AND dest_message_id IS NOT NULL "
         "ORDER BY rowid DESC LIMIT 1",
         (file_unique_id,),
     ).fetchone()
     if row is not None:
-        rowid, dest, message_id, message_link, dest_file_id = row
+        rowid, dest, message_id, dest_file_id = row
         if state["keyword_reply_message_check"] == "db":
-            if message_link:
-                return message_link
-            log.warning("saved destination message %s/%s has no stored link; resending GIF", dest, message_id)
+            link = _destination_message_link(dest, message_id)
+            if link:
+                return link
         else:
             try:
                 destination_message = await client.get_messages(dest, message_id)
@@ -483,11 +496,11 @@ async def _saved_destination_link(file_unique_id: str, fallback=None) -> str | N
                 new_message_id = getattr(resent, "id", None)
                 if new_message_id is not None:
                     db.execute(
-                        "UPDATE sent SET dest_message_id = ?, dest_message_link = ?, sent_at = datetime('now') WHERE rowid = ?",
-                        (new_message_id, getattr(resent, "link", None), rowid),
+                        "UPDATE sent SET dest_message_id = ?, sent_at = datetime('now') WHERE rowid = ?",
+                        (new_message_id, rowid),
                     )
                     db.commit()
-                    link = getattr(resent, "link", None)
+                    link = _destination_message_link(dest, new_message_id)
                     if link:
                         log.info("re-sent destination GIF unique_id=%s and refreshed message_id=%s", file_unique_id, new_message_id)
                         return link
@@ -1050,9 +1063,9 @@ async def cmd_backup(args, message) -> str:
     if action == "export":
         backup_path = DATA_DIR / f"gifcenter-backup-{int(time.time())}.zip"
         sent_rows = [dict(zip(
-            ("file_unique_id", "dest_file_id", "dest_file_unique_id", "dest_message_id", "dest_message_link", "dest", "sent_at"), row
+            ("file_unique_id", "dest_file_id", "dest_file_unique_id", "dest_message_id", "dest", "sent_at"), row
         )) for row in db.execute(
-            "SELECT file_unique_id, dest_file_id, dest_file_unique_id, dest_message_id, dest_message_link, dest, sent_at FROM sent"
+            "SELECT file_unique_id, dest_file_id, dest_file_unique_id, dest_message_id, dest, sent_at FROM sent"
         )]
         antispam_rows = [dict(zip(("file_unique_id", "expires_at"), row)) for row in db.execute(
             "SELECT file_unique_id, expires_at FROM keyword_antispam"
@@ -1109,9 +1122,9 @@ async def cmd_backup(args, message) -> str:
         db.execute("DELETE FROM keyword_antispam")
         db.execute("DELETE FROM keyword_reply_cooldown")
         db.executemany(
-            "INSERT INTO sent (file_unique_id, dest_file_id, dest_file_unique_id, dest_message_id, dest_message_link, dest, sent_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO sent (file_unique_id, dest_file_id, dest_file_unique_id, dest_message_id, dest, sent_at) VALUES (?, ?, ?, ?, ?, ?)",
             [(r.get("file_unique_id"), r.get("dest_file_id"), r.get("dest_file_unique_id"),
-              r.get("dest_message_id"), r.get("dest_message_link"), r.get("dest"), r.get("sent_at")) for r in sent_rows],
+              r.get("dest_message_id"), r.get("dest"), r.get("sent_at")) for r in sent_rows],
         )
         db.executemany(
             "INSERT INTO keyword_antispam (file_unique_id, expires_at) VALUES (?, ?)",
