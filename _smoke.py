@@ -29,7 +29,7 @@ assert reloaded == {"groups": [-1001, -1002], "dest": -2001, "delay": 1.5, "dedu
                        "keyword_allow_all": False, "keyword_users": [],
                        "keyword_antispam_enabled": True, "keyword_antispam_seconds": 300.0, "keyword_antispam_whitelist": True,
                        "keyword_reply_enabled": False, "keyword_reply_contains_enabled": False, "keyword_reply_delete_seconds": 60.0,
-                       "keyword_reply_cooldown_seconds": 300.0, "keyword_reply_delay_seconds": 1.0, "keyword_reply_resend": False}, reloaded
+                       "keyword_reply_cooldown_seconds": 300.0, "keyword_reply_delay_seconds": 1.0, "keyword_reply_resend": False, "keyword_reply_message_check": "db"}, reloaded
 ok("state save/load round-trip")
 
 # load_state on missing file -> defaults
@@ -40,7 +40,7 @@ assert d == {"groups": [], "dest": None, "delay": 2.0, "dedup": True,
              "keyword_allow_all": False, "keyword_users": [],
              "keyword_antispam_enabled": True, "keyword_antispam_seconds": 300.0, "keyword_antispam_whitelist": True,
              "keyword_reply_enabled": False, "keyword_reply_contains_enabled": False, "keyword_reply_delete_seconds": 60.0,
-             "keyword_reply_cooldown_seconds": 300.0, "keyword_reply_delay_seconds": 1.0, "keyword_reply_resend": False}, d
+             "keyword_reply_cooldown_seconds": 300.0, "keyword_reply_delay_seconds": 1.0, "keyword_reply_resend": False, "keyword_reply_message_check": "db"}, d
 ok("load_state defaults on missing file")
 
 # ── fakes ──

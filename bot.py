@@ -63,7 +63,7 @@ DEFAULT_STATE = {
     "keyword_antispam_whitelist": True,
     "keyword_reply_enabled": False, "keyword_reply_contains_enabled": False, "keyword_reply_delete_seconds": 60.0,
     "keyword_reply_cooldown_seconds": 300.0, "keyword_reply_delay_seconds": 1.0,
-    "keyword_reply_resend": False,
+    "keyword_reply_resend": False, "keyword_reply_message_check": "db",
 }
 
 
@@ -84,6 +84,8 @@ def normalize_state(state: dict) -> dict:
     state["keyword_reply_cooldown_seconds"] = float(state["keyword_reply_cooldown_seconds"])
     state["keyword_reply_delay_seconds"] = float(state["keyword_reply_delay_seconds"])
     state["keyword_reply_resend"] = bool(state["keyword_reply_resend"])
+    if state["keyword_reply_message_check"] not in ("db", "api"):
+        state["keyword_reply_message_check"] = "db"
     legacy_keywords = state.pop("keywords", [])
     state["keywords_exact"] = [str(k).casefold() for k in state["keywords_exact"] if str(k).strip()]
     state["keywords_contains"] = [str(k).casefold() for k in state["keywords_contains"] if str(k).strip()]
@@ -125,7 +127,7 @@ db = sqlite3.connect(str(SENT_DB))
 db.execute(
     "CREATE TABLE IF NOT EXISTS sent ("
     "file_unique_id TEXT, dest_file_id TEXT, dest_file_unique_id TEXT, "
-    "dest_message_id INTEGER, dest INTEGER NOT NULL, sent_at TEXT NOT NULL)"
+    "dest_message_id INTEGER, dest_message_link TEXT, dest INTEGER NOT NULL, sent_at TEXT NOT NULL)"
 )
 # Migrate the old schema. Older versions had a NOT NULL `file_id` column,
 # which cannot accept the new INSERT shape. Those old file_id values were the
@@ -138,7 +140,7 @@ if "file_id" in columns:
     db.execute(
         "CREATE TABLE sent_new ("
         "file_unique_id TEXT, dest_file_id TEXT, dest_file_unique_id TEXT, "
-        "dest_message_id INTEGER, dest INTEGER NOT NULL, sent_at TEXT NOT NULL)"
+        "dest_message_id INTEGER, dest_message_link TEXT, dest INTEGER NOT NULL, sent_at TEXT NOT NULL)"
     )
     db.execute("DROP TABLE sent")
     db.execute("ALTER TABLE sent_new RENAME TO sent")
@@ -151,6 +153,8 @@ if "dest_file_unique_id" not in columns:
     db.execute("ALTER TABLE sent ADD COLUMN dest_file_unique_id TEXT")
 if "dest_message_id" not in columns:
     db.execute("ALTER TABLE sent ADD COLUMN dest_message_id INTEGER")
+if "dest_message_link" not in columns:
+    db.execute("ALTER TABLE sent ADD COLUMN dest_message_link TEXT")
 db.execute("DROP INDEX IF EXISTS sent_ix")
 db.execute("DROP INDEX IF EXISTS sent_dest_unique_ix")
 db.execute("CREATE INDEX sent_ix ON sent (file_unique_id, dest)")
@@ -275,9 +279,9 @@ async def clone_media(message: Message, *, force: bool = False, return_message: 
             if sent_message is not None:
                 dest_message_id = getattr(sent_message, "id", None)
                 db.execute(
-                    "UPDATE sent SET dest_message_id = ?, sent_at = datetime('now') "
+                    "UPDATE sent SET dest_message_id = ?, dest_message_link = ?, sent_at = datetime('now') "
                     "WHERE rowid = (SELECT rowid FROM sent WHERE dest_file_id = ? AND dest = ? ORDER BY rowid DESC LIMIT 1)",
-                    (dest_message_id, cached[0], dest),
+                    (dest_message_id, getattr(sent_message, "link", None), cached[0], dest),
                 )
                 db.commit()
             return sent_message if return_message else sent_message is not None
@@ -342,9 +346,9 @@ async def clone_media(message: Message, *, force: bool = False, return_message: 
         return sent_message if return_message else True
 
     db.execute(
-        "INSERT INTO sent (file_unique_id, dest_file_id, dest_file_unique_id, dest_message_id, dest, sent_at) "
-        "VALUES (?, ?, ?, ?, ?, datetime('now'))",
-        (source_unique_id, dest_file_id, dest_unique_id, getattr(sent_message, "id", None), dest),
+        "INSERT INTO sent (file_unique_id, dest_file_id, dest_file_unique_id, dest_message_id, dest_message_link, dest, sent_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, datetime('now'))",
+        (source_unique_id, dest_file_id, dest_unique_id, getattr(sent_message, "id", None), getattr(sent_message, "link", None), dest),
     )
     db.commit()
     log.info(
@@ -453,20 +457,25 @@ async def _queue_keyword_reply(message: Message, value: str, *, mode: str = "lin
 
 async def _saved_destination_link(file_unique_id: str, fallback=None) -> str | None:
     row = db.execute(
-        "SELECT rowid, dest, dest_message_id, dest_file_id FROM sent "
+        "SELECT rowid, dest, dest_message_id, dest_message_link, dest_file_id FROM sent "
         "WHERE file_unique_id = ? AND dest_message_id IS NOT NULL "
         "ORDER BY rowid DESC LIMIT 1",
         (file_unique_id,),
     ).fetchone()
     if row is not None:
-        rowid, dest, message_id, dest_file_id = row
-        try:
-            destination_message = await client.get_messages(dest, message_id)
-            link = getattr(destination_message, "link", None)
-            if link:
-                return link
-        except Exception:
-            log.warning("could not fetch saved destination message %s/%s; resending GIF", dest, message_id)
+        rowid, dest, message_id, message_link, dest_file_id = row
+        if state["keyword_reply_message_check"] == "db":
+            if message_link:
+                return message_link
+            log.warning("saved destination message %s/%s has no stored link; resending GIF", dest, message_id)
+        else:
+            try:
+                destination_message = await client.get_messages(dest, message_id)
+                link = getattr(destination_message, "link", None)
+                if link:
+                    return link
+            except Exception:
+                log.warning("could not fetch saved destination message %s/%s; resending GIF", dest, message_id)
 
         if dest_file_id:
             try:
@@ -474,8 +483,8 @@ async def _saved_destination_link(file_unique_id: str, fallback=None) -> str | N
                 new_message_id = getattr(resent, "id", None)
                 if new_message_id is not None:
                     db.execute(
-                        "UPDATE sent SET dest_message_id = ?, sent_at = datetime('now') WHERE rowid = ?",
-                        (new_message_id, rowid),
+                        "UPDATE sent SET dest_message_id = ?, dest_message_link = ?, sent_at = datetime('now') WHERE rowid = ?",
+                        (new_message_id, getattr(resent, "link", None), rowid),
                     )
                     db.commit()
                     link = getattr(resent, "link", None)
@@ -843,7 +852,8 @@ async def cmd_kw(args, message) -> str:
             f"- *Link reply delete delay:* `{state['keyword_reply_delete_seconds']}s`\n"
             f"- *Link reply cooldown:* `{state['keyword_reply_cooldown_seconds']}s`\n"
             f"- *Link reply queue delay:* `{state['keyword_reply_delay_seconds']}s`\n"
-            f"- *Reply mode:* `{"resend GIF" if state['keyword_reply_resend'] else "destination link"}`"
+            f"- *Reply mode:* `{"resend GIF" if state['keyword_reply_resend'] else "destination link"}`\n"
+            f"- *Reply message check:* `{state['keyword_reply_message_check']}`"
         )
     sub = args[1].casefold()
     if sub == "help":
@@ -862,6 +872,7 @@ async def cmd_kw(args, message) -> str:
                 f"`{PREFIX}gc kw reply cooldown <s|m>`\n"
                 f"`{PREFIX}gc kw reply delay <s|m>`\n"
                 f"`{PREFIX}gc kw reply resend on|off`\n"
+                f"`{PREFIX}gc kw reply check db|api`\n"
                 f"`{PREFIX}gc kw user add|remove|list <user_id>`")
 
     if sub == "reply":
@@ -871,7 +882,8 @@ async def cmd_kw(args, message) -> str:
                     f"delete delay: {state['keyword_reply_delete_seconds']}s\n"
                     f"cooldown: {state['keyword_reply_cooldown_seconds']}s\n"
                     f"queue delay: {state['keyword_reply_delay_seconds']}s\n"
-                    f"mode: {"resend GIF" if state["keyword_reply_resend"] else "destination link"}")
+                    f"mode: {'resend GIF' if state['keyword_reply_resend'] else 'destination link'}\n"
+                    f"message check: {state['keyword_reply_message_check']}")
         action = args[2].casefold()
         if action in ("on", "off"):
             state["keyword_reply_enabled"] = action == "on"
@@ -884,6 +896,12 @@ async def cmd_kw(args, message) -> str:
             state["keyword_reply_resend"] = value == "on"
             save_state(state)
             return f"keyword reply resend GIF: {value}"
+        if action == "check":
+            if len(args) < 4 or args[3].casefold() not in ("db", "api"):
+                return f"usage: `{PREFIX}gc kw reply check <db|api>`"
+            state["keyword_reply_message_check"] = args[3].casefold()
+            save_state(state)
+            return f"keyword reply message check: {state["keyword_reply_message_check"]}"
         if action == "contains":
             if len(args) < 4 or args[3].casefold() not in ("on", "off"):
                 return f"usage: `{PREFIX}gc kw reply contains <on|off>`"
@@ -1032,9 +1050,9 @@ async def cmd_backup(args, message) -> str:
     if action == "export":
         backup_path = DATA_DIR / f"gifcenter-backup-{int(time.time())}.zip"
         sent_rows = [dict(zip(
-            ("file_unique_id", "dest_file_id", "dest_file_unique_id", "dest_message_id", "dest", "sent_at"), row
+            ("file_unique_id", "dest_file_id", "dest_file_unique_id", "dest_message_id", "dest_message_link", "dest", "sent_at"), row
         )) for row in db.execute(
-            "SELECT file_unique_id, dest_file_id, dest_file_unique_id, dest_message_id, dest, sent_at FROM sent"
+            "SELECT file_unique_id, dest_file_id, dest_file_unique_id, dest_message_id, dest_message_link, dest, sent_at FROM sent"
         )]
         antispam_rows = [dict(zip(("file_unique_id", "expires_at"), row)) for row in db.execute(
             "SELECT file_unique_id, expires_at FROM keyword_antispam"
@@ -1091,9 +1109,9 @@ async def cmd_backup(args, message) -> str:
         db.execute("DELETE FROM keyword_antispam")
         db.execute("DELETE FROM keyword_reply_cooldown")
         db.executemany(
-            "INSERT INTO sent (file_unique_id, dest_file_id, dest_file_unique_id, dest_message_id, dest, sent_at) VALUES (?, ?, ?, ?, ?, ?)",
+            "INSERT INTO sent (file_unique_id, dest_file_id, dest_file_unique_id, dest_message_id, dest_message_link, dest, sent_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
             [(r.get("file_unique_id"), r.get("dest_file_id"), r.get("dest_file_unique_id"),
-              r.get("dest_message_id"), r.get("dest"), r.get("sent_at")) for r in sent_rows],
+              r.get("dest_message_id"), r.get("dest_message_link"), r.get("dest"), r.get("sent_at")) for r in sent_rows],
         )
         db.executemany(
             "INSERT INTO keyword_antispam (file_unique_id, expires_at) VALUES (?, ?)",
