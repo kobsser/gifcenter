@@ -63,7 +63,7 @@ DEFAULT_STATE = {
     "keyword_antispam_whitelist": True,
     "keyword_reply_enabled": False, "keyword_reply_contains_enabled": False, "keyword_reply_delete_seconds": 60.0,
     "keyword_reply_cooldown_seconds": 300.0, "keyword_reply_delay_seconds": 1.0,
-    "keyword_reply_resend": False, "keyword_reply_message_check": "db",
+    "keyword_reply_resend": False, "keyword_reply_message_check": "db", "admins": [],
 }
 
 
@@ -86,6 +86,7 @@ def normalize_state(state: dict) -> dict:
     state["keyword_reply_resend"] = bool(state["keyword_reply_resend"])
     if state["keyword_reply_message_check"] not in ("db", "api"):
         state["keyword_reply_message_check"] = "db"
+    state["admins"] = [int(u) for u in state["admins"]]
     legacy_keywords = state.pop("keywords", [])
     state["keywords_exact"] = [str(k).casefold() for k in state["keywords_exact"] if str(k).strip()]
     state["keywords_contains"] = [str(k).casefold() for k in state["keywords_contains"] if str(k).strip()]
@@ -164,11 +165,29 @@ db.execute("DROP INDEX IF EXISTS sent_ix")
 db.execute("DROP INDEX IF EXISTS sent_dest_unique_ix")
 db.execute("CREATE INDEX sent_ix ON sent (file_unique_id, dest)")
 db.execute("CREATE INDEX sent_dest_unique_ix ON sent (dest_file_unique_id, dest)")
+db.execute("CREATE TABLE IF NOT EXISTS blacklist (file_unique_id TEXT PRIMARY KEY, banned_at TEXT NOT NULL)")
 db.execute(
     "CREATE TABLE IF NOT EXISTS keyword_antispam ("
     "file_unique_id TEXT PRIMARY KEY, expires_at REAL NOT NULL)"
 )
 db.commit()
+
+
+def is_blacklisted(*file_unique_ids: str | None) -> bool:
+    ids = [uid for uid in file_unique_ids if uid]
+    if not ids:
+        return False
+    placeholders = ",".join("?" for _ in ids)
+    return db.execute(f"SELECT 1 FROM blacklist WHERE file_unique_id IN ({placeholders}) LIMIT 1", ids).fetchone() is not None
+
+
+def add_blacklist_ids(file_unique_ids: list[str]) -> None:
+    db.executemany("INSERT OR IGNORE INTO blacklist (file_unique_id, banned_at) VALUES (?, datetime('now'))", [(uid,) for uid in set(file_unique_ids) if uid])
+    db.commit()
+
+
+def _is_admin(user_id: int | None) -> bool:
+    return user_id is not None and (user_id == getattr(client.me, "id", None) or user_id in set(state["admins"]))
 
 
 def try_reserve_keyword_antispam(file_unique_id: str) -> tuple[bool, float]:
@@ -258,6 +277,9 @@ async def clone_media(message: Message, *, force: bool = False, return_message: 
     anim = message.animation
     source_file_id = anim.file_id
     source_unique_id = anim.file_unique_id
+    if is_blacklisted(source_unique_id):
+        log.info("skip %s/%s: GIF unique_id=%s is blacklisted", message.chat.id, message.id, source_unique_id)
+        return False
     cached = db.execute(
         "SELECT dest_file_id FROM sent "
         "WHERE (file_unique_id = ? OR dest_file_unique_id = ?) "
@@ -523,6 +545,47 @@ async def _delete_keyword_reply_later(reply: Message) -> None:
 
 
 
+@client.on_edited_message()
+async def on_edited_message(app, message, *a):
+    if state["dest"] is None or message.chat.id != state["dest"]:
+        return
+    caption = (getattr(message, "text", None) or getattr(message, "caption", None) or "").strip().casefold()
+    if message.animation is None or caption != "ban":
+        return
+    if not _is_admin(getattr(getattr(message, "from_user", None), "id", None)):
+        return
+
+    dest_uid = message.animation.file_unique_id
+    rows = db.execute(
+        "SELECT rowid, file_unique_id, dest_file_unique_id, dest_message_id FROM sent WHERE dest = ? AND (dest_message_id = ? OR dest_file_unique_id = ? OR file_unique_id = ?)",
+        (state["dest"], message.id, dest_uid, dest_uid),
+    ).fetchall()
+    rows += db.execute(
+        "SELECT rowid, file_unique_id, dest_file_unique_id, dest_message_id FROM sent WHERE dest = ? AND dest_file_unique_id = ?",
+        (state["dest"], dest_uid),
+    ).fetchall()
+    blacklist_ids = {dest_uid}
+    message_ids = {message.id}
+    rowids = set()
+    for rowid, source_uid, cached_uid, dest_message_id in rows:
+        rowids.add(rowid)
+        blacklist_ids.update(uid for uid in (source_uid, cached_uid) if uid)
+        if dest_message_id is not None:
+            message_ids.add(dest_message_id)
+    add_blacklist_ids(list(blacklist_ids))
+    for message_id in sorted(message_ids):
+        try:
+            await client.delete_messages(state["dest"], message_id)
+        except errors.RPCError as e:
+            log.info("blacklist delete skipped for destination message %s: %s", message_id, e)
+        except Exception:
+            log.exception("failed to delete blacklisted destination message %s", message_id)
+    if rowids:
+        db.executemany("UPDATE sent SET dest_message_id = NULL WHERE rowid = ?", [(rowid,) for rowid in rowids])
+        db.commit()
+    log.info("blacklisted GIF unique_ids=%s; deleted %d destination message(s)", sorted(blacklist_ids), len(message_ids))
+
+
 @client.on_message(filters.group)
 async def on_group_message(app, message, *a):
     if message.chat.id not in state["groups"]:
@@ -548,6 +611,9 @@ async def on_group_message(app, message, *a):
     if replied is None or replied.animation is None:
         return
     file_unique_id = replied.animation.file_unique_id
+    if is_blacklisted(file_unique_id):
+        log.info("keyword %r ignored: GIF unique_id=%s is blacklisted", keyword, file_unique_id)
+        return
     is_whitelisted = message.from_user.id in state["keyword_users"]
     if is_whitelisted and not state["keyword_antispam_whitelist"]:
         log.info("keyword %r accepted for whitelisted user %s: anti-spam bypassed for GIF unique_id=%s", keyword, message.from_user.id, file_unique_id)
@@ -637,7 +703,8 @@ HELP_TEXT = (
     f"`{PREFIX}gc kw reply resend on|off` - send GIF or destination link\n"
     f"`{PREFIX}gc backup export` - export state and GIF cache\n"
     f"`{PREFIX}gc backup import` - import a replied backup file\n"
-    f"`{PREFIX}gc kw help` - show keyword help"
+    f"`{PREFIX}gc kw help` - show keyword help\n"
+    f"`{PREFIX}gc admin add|remove|list <user_id>` - manage ban admins"
 )
 
 
@@ -799,6 +866,8 @@ async def cmd_status(args, message) -> str:
         f"- *Destination:* `{'set' if state['dest'] is not None else 'not set'}`",
         f"- *Send delay:* `{state['delay']}s`",
         f"- *Destination dedup:* `{'on' if state['dedup'] else 'off'}`",
+        f"- *Ban admins:* `{len(state['admins'])}`",
+        f"- *Blacklisted GIFs:* `{db.execute('SELECT COUNT(*) FROM blacklist').fetchone()[0]}`",
         f"- *Keywords:* `{'on' if state['keywords_enabled'] else 'off'}`",
         f"- *Keyword access:* `{'everyone' if state['keyword_allow_all'] else 'whitelist only'}`",
         f"- *Exact keywords:* `{len(state['keywords_exact'])}`",
@@ -1055,6 +1124,32 @@ async def cmd_kw(args, message) -> str:
     return f"unknown kw subcommand; use `{PREFIX}gc kw help`"
 
 
+async def cmd_admin(args, message) -> str:
+    if len(args) < 2 or args[1].casefold() not in ("add", "remove", "list"):
+        return f"usage: `{PREFIX}gc admin <add|remove|list> [user_id]`"
+    action = args[1].casefold()
+    if action == "list":
+        return "\n".join(map(str, state["admins"])) or "(none)"
+    if len(args) < 3:
+        return f"usage: `{PREFIX}gc admin {action} <user_id>`"
+    try:
+        uid = int(args[2])
+    except ValueError:
+        return "user_id must be an integer"
+    if uid == client.me.id:
+        return "owner is always an admin"
+    if action == "add":
+        if uid not in state["admins"]:
+            state["admins"].append(uid)
+            save_state(state)
+        return f"admin added: {uid}"
+    if uid not in state["admins"]:
+        return "admin not found"
+    state["admins"].remove(uid)
+    save_state(state)
+    return f"admin removed: {uid}"
+
+
 async def cmd_backup(args, message) -> str:
     if len(args) < 2 or args[1].casefold() not in ("export", "import"):
         return f"usage: `{PREFIX}gc backup export` or `{PREFIX}gc backup import`"
@@ -1073,12 +1168,16 @@ async def cmd_backup(args, message) -> str:
         reply_rows = [dict(zip(("file_unique_id", "expires_at"), row)) for row in db.execute(
             "SELECT file_unique_id, expires_at FROM keyword_reply_cooldown"
         )]
+        blacklist_rows = [dict(zip(("file_unique_id", "banned_at"), row)) for row in db.execute(
+            "SELECT file_unique_id, banned_at FROM blacklist"
+        )]
         payload = {
             "version": BACKUP_VERSION,
             "state": state,
             "sent": sent_rows,
             "keyword_antispam": antispam_rows,
             "keyword_reply_cooldown": reply_rows,
+            "blacklist": blacklist_rows,
         }
         try:
             with zipfile.ZipFile(backup_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
@@ -1114,13 +1213,15 @@ async def cmd_backup(args, message) -> str:
         sent_rows = payload.get("sent", [])
         antispam_rows = payload.get("keyword_antispam", [])
         reply_rows = payload.get("keyword_reply_cooldown", [])
-        if not all(isinstance(row, dict) for row in sent_rows + antispam_rows + reply_rows):
+        blacklist_rows = payload.get("blacklist", [])
+        if not all(isinstance(row, dict) for row in sent_rows + antispam_rows + reply_rows + blacklist_rows):
             raise ValueError("invalid backup rows")
 
         db.execute("BEGIN")
         db.execute("DELETE FROM sent")
         db.execute("DELETE FROM keyword_antispam")
         db.execute("DELETE FROM keyword_reply_cooldown")
+        db.execute("DELETE FROM blacklist")
         db.executemany(
             "INSERT INTO sent (file_unique_id, dest_file_id, dest_file_unique_id, dest_message_id, dest, sent_at) VALUES (?, ?, ?, ?, ?, ?)",
             [(r.get("file_unique_id"), r.get("dest_file_id"), r.get("dest_file_unique_id"),
@@ -1133,6 +1234,10 @@ async def cmd_backup(args, message) -> str:
         db.executemany(
             "INSERT INTO keyword_reply_cooldown (file_unique_id, expires_at) VALUES (?, ?)",
             [(r.get("file_unique_id"), float(r.get("expires_at"))) for r in reply_rows],
+        )
+        db.executemany(
+            "INSERT INTO blacklist (file_unique_id, banned_at) VALUES (?, ?)",
+            [(r.get("file_unique_id"), r.get("banned_at")) for r in blacklist_rows],
         )
         db.commit()
 
@@ -1184,6 +1289,8 @@ async def gc_command(app, message: Message, *a):
             text = await cmd_status(args, message)
         elif cmd == "kw":
             text = await cmd_kw(args, message)
+        elif cmd == "admin":
+            text = await cmd_admin(args, message)
         elif cmd == "backup":
             text = await cmd_backup(args, message)
         elif cmd == "session":
