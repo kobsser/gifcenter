@@ -453,19 +453,37 @@ async def _queue_keyword_reply(message: Message, value: str, *, mode: str = "lin
 
 async def _saved_destination_link(file_unique_id: str, fallback=None) -> str | None:
     row = db.execute(
-        "SELECT dest, dest_message_id FROM sent "
+        "SELECT rowid, dest, dest_message_id, dest_file_id FROM sent "
         "WHERE file_unique_id = ? AND dest_message_id IS NOT NULL "
         "ORDER BY rowid DESC LIMIT 1",
         (file_unique_id,),
     ).fetchone()
     if row is not None:
+        rowid, dest, message_id, dest_file_id = row
         try:
-            destination_message = await client.get_messages(row[0], row[1])
+            destination_message = await client.get_messages(dest, message_id)
             link = getattr(destination_message, "link", None)
             if link:
                 return link
         except Exception:
-            log.warning("could not fetch saved destination message %s/%s", row[0], row[1])
+            log.warning("could not fetch saved destination message %s/%s; resending GIF", dest, message_id)
+
+        if dest_file_id:
+            try:
+                resent = await send_with_flood_retry("send_cached_media", dest, dest_file_id)
+                new_message_id = getattr(resent, "id", None)
+                if new_message_id is not None:
+                    db.execute(
+                        "UPDATE sent SET dest_message_id = ?, sent_at = datetime('now') WHERE rowid = ?",
+                        (new_message_id, rowid),
+                    )
+                    db.commit()
+                    link = getattr(resent, "link", None)
+                    if link:
+                        log.info("re-sent destination GIF unique_id=%s and refreshed message_id=%s", file_unique_id, new_message_id)
+                        return link
+            except Exception:
+                log.exception("failed to resend destination GIF unique_id=%s", file_unique_id)
     return getattr(fallback, "link", None)
 
 
