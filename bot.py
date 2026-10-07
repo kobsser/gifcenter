@@ -482,12 +482,17 @@ async def _queue_keyword_reply(message: Message, value: str, *, mode: str = "lin
     return await result
 
 
-def _destination_message_link(dest: int, message_id: int) -> str | None:
+async def _destination_message_link(dest: int, message_id: int) -> str | None:
     if dest is None or message_id is None:
         return None
-    chat_id = int(dest)
-    internal_id = -chat_id - 1000000000000 if chat_id <= -1000000000000 else -chat_id
-    return f"https://t.me/c/{internal_id}/{int(message_id)}"
+    try:
+        chat = await client.get_chat(dest)
+        username = getattr(chat, "username", None)
+        if username:
+            return f"https://t.me/{username}/{int(message_id)}"
+    except Exception:
+        log.warning("could not resolve public username for destination %s", dest)
+    return None
 
 
 async def _saved_destination_link(file_unique_id: str, fallback=None) -> str | None:
@@ -500,7 +505,7 @@ async def _saved_destination_link(file_unique_id: str, fallback=None) -> str | N
     if row is not None:
         rowid, dest, message_id, dest_file_id = row
         if state["keyword_reply_message_check"] == "db":
-            link = _destination_message_link(dest, message_id)
+            link = await _destination_message_link(dest, message_id)
             if link:
                 return link
         else:
@@ -522,7 +527,7 @@ async def _saved_destination_link(file_unique_id: str, fallback=None) -> str | N
                         (new_message_id, rowid),
                     )
                     db.commit()
-                    link = _destination_message_link(dest, new_message_id)
+                    link = await _destination_message_link(dest, new_message_id)
                     if link:
                         log.info("re-sent destination GIF unique_id=%s and refreshed message_id=%s", file_unique_id, new_message_id)
                         return link

@@ -233,7 +233,7 @@ ok("gc_command: .gc session awaits export_session_string (no coroutine concat)")
 
 # mocks for the n=50000 path (get_chat -> member check -> history)
 async def fake_get_chat(gid):
-    return types.SimpleNamespace(id=gid, type=enums.ChatType.GROUP, title="G", username=None)
+    return types.SimpleNamespace(id=gid, type=enums.ChatType.GROUP, title="G", username="gifcenter_test")
 async def fake_member(chat_id, uid):
     return types.SimpleNamespace(status=enums.ChatMemberStatus.MEMBER)
 async def hist_mock(gid, limit=None):
@@ -365,8 +365,7 @@ calls.clear()
 asyncio.run(bot.on_group_message(None, link_trigger))
 assert calls == [
     ("cached", -2001, "KW-LINK"),
-    ("get_messages", -2001, 1),
-    ("reply", -1001, "https://saved.example/-2001/1", 921),
+    ("reply", -1001, "https://t.me/gifcenter_test/1", 921),
 ], calls
 ok("exact keyword: sends destination post link as reply")
 
@@ -379,7 +378,7 @@ calls.clear()
 asyncio.run(bot.on_group_message(None, contains_link_trigger))
 assert calls == [
     ("cached", -2001, "KW-CONTAINS-LINK"),
-    ("reply", -1001, "https://t.me/c/-999999997999/2", 923),
+    ("reply", -1001, "https://t.me/gifcenter_test/2", 923),
 ], calls
 ok("contains keyword: sends destination post link as reply")
 
