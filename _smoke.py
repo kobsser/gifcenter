@@ -369,6 +369,39 @@ assert calls == [
 ], calls
 ok("exact keyword: sends destination post link as reply")
 
+# Link mode must use the already-saved destination message on a dedup hit; it
+# must not resend the GIF merely to obtain a message ID.
+bot.db.execute("DELETE FROM keyword_reply_cooldown")
+bot.db.commit()
+existing_link_trigger = Msg(gid=-1001, from_id=123, anim=False, mid=926)
+existing_link_trigger.text = "again"
+existing_link_trigger.reply_to_message = reply_source
+calls.clear()
+asyncio.run(bot.on_group_message(None, existing_link_trigger))
+assert calls == [
+    ("reply", -1001, "https://t.me/gifcenter_test/1", 926),
+], calls
+ok("keyword link: dedup hit uses saved destination message without resend")
+
+# A keyword GIF can also be resolved through its destination file_unique_id.
+bot.db.execute("DELETE FROM keyword_reply_cooldown")
+bot.db.execute(
+    "INSERT INTO sent (file_unique_id, dest_file_id, dest_file_unique_id, dest_message_id, dest, sent_at) "
+    "VALUES (?, ?, ?, ?, ?, datetime('now'))",
+    ("OTHER-SOURCE-LINK", "DEST-FILE-LINK", "DEST-UNIQUE-LINK", 44, -2001),
+)
+bot.db.commit()
+dest_uid_source = Msg(gid=-1001, from_id=77, fid="SOURCE-FILE-LINK", unique_id="DEST-UNIQUE-LINK", mid=927)
+dest_uid_trigger = Msg(gid=-1001, from_id=123, anim=False, mid=928)
+dest_uid_trigger.text = "again"
+dest_uid_trigger.reply_to_message = dest_uid_source
+calls.clear()
+asyncio.run(bot.on_group_message(None, dest_uid_trigger))
+assert calls == [
+    ("reply", -1001, "https://t.me/gifcenter_test/44", 928),
+], calls
+ok("keyword link: destination file_unique_id lookup works without resend")
+
 # Contains-keyword link replies use the same reply path.
 contains_link_source = Msg(gid=-1001, from_id=77, fid="KW-CONTAINS-LINK", unique_id="KW-CONTAINS-LINK-U", mid=924)
 contains_link_trigger = Msg(gid=-1001, from_id=123, anim=False, mid=923)
@@ -383,6 +416,8 @@ assert calls == [
 ok("contains keyword: sends destination post link as reply")
 
 # Reply mode can resend the cached destination GIF instead of linking it.
+bot.db.execute("DELETE FROM keyword_reply_cooldown")
+bot.db.commit()
 bot.state["keyword_reply_resend"] = True
 bot.db.execute("DELETE FROM keyword_reply_cooldown")
 bot.db.commit()
@@ -392,10 +427,9 @@ resend_trigger.reply_to_message = reply_source
 calls.clear()
 asyncio.run(bot.on_group_message(None, resend_trigger))
 assert calls == [
-    ("cached", -2001, "DEST-KW-LINK"),
     ("cached", -1001, "DEST-KW-LINK"),
 ], calls
-ok("keyword reply: resend mode sends destination GIF by file_id")
+ok("keyword reply: resend mode sends destination GIF by file_id without duplicate destination send")
 bot.state["keyword_reply_resend"] = False
 
 second_link_trigger = Msg(gid=-1001, from_id=456, anim=False, mid=922)
@@ -403,7 +437,7 @@ second_link_trigger.text = "again"
 second_link_trigger.reply_to_message = reply_source
 calls.clear()
 asyncio.run(bot.on_group_message(None, second_link_trigger))
-assert calls == [("cached", -2001, "DEST-KW-LINK")], calls
+assert calls == [], calls
 ok("exact keyword: link reply cooldown is shared across users")
 
 bot.state["keyword_antispam_enabled"] = True

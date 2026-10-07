@@ -498,32 +498,67 @@ async def _destination_message_link(dest: int, message_id: int) -> str | None:
 async def _saved_destination_link(file_unique_id: str, fallback=None) -> str | None:
     """Return the existing destination message link without sending anything.
 
-    Link mode must never resend the GIF. If the saved message cannot be
-    resolved, the reply simply fails instead of creating a new destination
-    message.
+    Link mode must never resend the GIF. Search both the source and destination
+    unique IDs because deduplication accepts either identity. Prefer the
+    configured destination chat and the newest row with a saved message ID.
     """
-    row = db.execute(
-        "SELECT dest, dest_message_id FROM sent "
-        "WHERE file_unique_id = ? AND dest_message_id IS NOT NULL "
-        "ORDER BY rowid DESC LIMIT 1",
-        (file_unique_id,),
-    ).fetchone()
+    dest = state.get("dest")
+    if dest is not None:
+        row = db.execute(
+            "SELECT dest, dest_message_id, file_unique_id, dest_file_unique_id "
+            "FROM sent "
+            "WHERE dest = ? AND dest_message_id IS NOT NULL "
+            "AND (file_unique_id = ? OR dest_file_unique_id = ?) "
+            "ORDER BY rowid DESC LIMIT 1",
+            (dest, file_unique_id, file_unique_id),
+        ).fetchone()
+    else:
+        row = None
+
+    if row is None:
+        row = db.execute(
+            "SELECT dest, dest_message_id, file_unique_id, dest_file_unique_id "
+            "FROM sent "
+            "WHERE dest_message_id IS NOT NULL "
+            "AND (file_unique_id = ? OR dest_file_unique_id = ?) "
+            "ORDER BY rowid DESC LIMIT 1",
+            (file_unique_id, file_unique_id),
+        ).fetchone()
+
     if row is not None:
-        dest, message_id = row
+        saved_dest, message_id, source_uid, dest_uid = row
         if state["keyword_reply_message_check"] == "db":
-            link = await _destination_message_link(dest, message_id)
+            link = await _destination_message_link(saved_dest, message_id)
             if link:
+                log.info(
+                    "keyword link lookup: found saved destination message %s/%s "
+                    "for source unique_id=%s (destination unique_id=%s)",
+                    saved_dest, message_id, source_uid, dest_uid,
+                )
                 return link
         else:
             try:
-                destination_message = await client.get_messages(dest, message_id)
+                destination_message = await client.get_messages(saved_dest, message_id)
                 resolved_id = getattr(destination_message, "id", None)
                 if resolved_id is not None:
-                    link = await _destination_message_link(dest, resolved_id)
+                    link = await _destination_message_link(saved_dest, resolved_id)
                     if link:
+                        log.info(
+                            "keyword link lookup: verified destination message %s/%s "
+                            "for source unique_id=%s (destination unique_id=%s)",
+                            saved_dest, resolved_id, source_uid, dest_uid,
+                        )
                         return link
             except Exception:
-                log.warning("could not fetch saved destination message %s/%s for link reply", dest, message_id)
+                log.warning(
+                    "could not fetch saved destination message %s/%s for link reply",
+                    saved_dest, message_id,
+                )
+    else:
+        log.warning(
+            "keyword link lookup: no saved destination message ID for GIF unique_id=%s",
+            file_unique_id,
+        )
 
     if fallback is not None:
         fallback_id = getattr(fallback, "id", None)
