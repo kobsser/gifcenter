@@ -665,14 +665,19 @@ async def on_group_message(app, message, *a):
         state["keyword_reply_enabled"] if reply_mode == "exact"
         else state["keyword_reply_contains_enabled"]
     )
-    result = await send_to_dest_with_force(
+    # Keyword handling must respect normal destination deduplication. In
+    # particular, link-reply mode must not force a fresh destination GIF; it
+    # should link to the existing tracked destination message.
+    result = await _queue_send(
         replied,
+        force=False,
         return_message=reply_enabled,
     )
     ok = result is not False and result is not None
-    if not ok and not (is_whitelisted and not state["keyword_antispam_whitelist"]):
-        release_keyword_antispam(file_unique_id)
-        log.info("keyword GIF unique_id=%s send failed; anti-spam reservation released", file_unique_id)
+    if not ok and not reply_enabled:
+        if not (is_whitelisted and not state["keyword_antispam_whitelist"]):
+            release_keyword_antispam(file_unique_id)
+        log.info("keyword GIF unique_id=%s send failed; no reply configured", file_unique_id)
         return
 
     if not reply_enabled:
