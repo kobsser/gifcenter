@@ -496,14 +496,20 @@ async def _destination_message_link(dest: int, message_id: int) -> str | None:
 
 
 async def _saved_destination_link(file_unique_id: str, fallback=None) -> str | None:
+    """Return the existing destination message link without sending anything.
+
+    Link mode must never resend the GIF. If the saved message cannot be
+    resolved, the reply simply fails instead of creating a new destination
+    message.
+    """
     row = db.execute(
-        "SELECT rowid, dest, dest_message_id, dest_file_id FROM sent "
+        "SELECT dest, dest_message_id FROM sent "
         "WHERE file_unique_id = ? AND dest_message_id IS NOT NULL "
         "ORDER BY rowid DESC LIMIT 1",
         (file_unique_id,),
     ).fetchone()
     if row is not None:
-        rowid, dest, message_id, dest_file_id = row
+        dest, message_id = row
         if state["keyword_reply_message_check"] == "db":
             link = await _destination_message_link(dest, message_id)
             if link:
@@ -511,29 +517,22 @@ async def _saved_destination_link(file_unique_id: str, fallback=None) -> str | N
         else:
             try:
                 destination_message = await client.get_messages(dest, message_id)
-                link = getattr(destination_message, "link", None)
-                if link:
-                    return link
-            except Exception:
-                log.warning("could not fetch saved destination message %s/%s; resending GIF", dest, message_id)
-
-        if dest_file_id:
-            try:
-                resent = await send_with_flood_retry("send_cached_media", dest, dest_file_id)
-                new_message_id = getattr(resent, "id", None)
-                if new_message_id is not None:
-                    db.execute(
-                        "UPDATE sent SET dest_message_id = ?, sent_at = datetime('now') WHERE rowid = ?",
-                        (new_message_id, rowid),
-                    )
-                    db.commit()
-                    link = await _destination_message_link(dest, new_message_id)
+                resolved_id = getattr(destination_message, "id", None)
+                if resolved_id is not None:
+                    link = await _destination_message_link(dest, resolved_id)
                     if link:
-                        log.info("re-sent destination GIF unique_id=%s and refreshed message_id=%s", file_unique_id, new_message_id)
                         return link
             except Exception:
-                log.exception("failed to resend destination GIF unique_id=%s", file_unique_id)
-    return getattr(fallback, "link", None)
+                log.warning("could not fetch saved destination message %s/%s for link reply", dest, message_id)
+
+    if fallback is not None:
+        fallback_id = getattr(fallback, "id", None)
+        fallback_dest = state.get("dest")
+        if fallback_id is not None and fallback_dest is not None:
+            link = await _destination_message_link(fallback_dest, fallback_id)
+            if link:
+                return link
+    return None
 
 
 async def _delete_keyword_reply_later(reply: Message) -> None:
