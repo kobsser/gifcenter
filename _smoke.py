@@ -28,8 +28,8 @@ assert reloaded == {"groups": [-1001, -1002], "dest": -2001, "delay": 1.5, "dedu
                        "keywords_exact": [], "keywords_contains": [], "keywords_enabled": False,
                        "keyword_allow_all": False, "keyword_users": [],
                        "keyword_antispam_enabled": True, "keyword_antispam_seconds": 300.0, "keyword_antispam_whitelist": True,
-                       "keyword_reply_enabled": False, "keyword_reply_delete_seconds": 60.0,
-                       "keyword_reply_cooldown_seconds": 300.0, "keyword_reply_delay_seconds": 1.0}, reloaded
+                       "keyword_reply_enabled": False, "keyword_reply_contains_enabled": False, "keyword_reply_delete_seconds": 60.0,
+                       "keyword_reply_cooldown_seconds": 300.0, "keyword_reply_delay_seconds": 1.0, "keyword_reply_resend": False}, reloaded
 ok("state save/load round-trip")
 
 # load_state on missing file -> defaults
@@ -39,8 +39,8 @@ assert d == {"groups": [], "dest": None, "delay": 2.0, "dedup": True,
              "keywords_exact": [], "keywords_contains": [], "keywords_enabled": False,
              "keyword_allow_all": False, "keyword_users": [],
              "keyword_antispam_enabled": True, "keyword_antispam_seconds": 300.0, "keyword_antispam_whitelist": True,
-             "keyword_reply_enabled": False, "keyword_reply_delete_seconds": 60.0,
-             "keyword_reply_cooldown_seconds": 300.0, "keyword_reply_delay_seconds": 1.0}, d
+             "keyword_reply_enabled": False, "keyword_reply_contains_enabled": False, "keyword_reply_delete_seconds": 60.0,
+             "keyword_reply_cooldown_seconds": 300.0, "keyword_reply_delay_seconds": 1.0, "keyword_reply_resend": False}, d
 ok("load_state defaults on missing file")
 
 # ── fakes ──
@@ -85,9 +85,10 @@ me = U(5, self_=True)
 client.me = me
 
 calls = []
-async def cached(cid, fid, *a, **k):
-    calls.append(("cached", cid, fid)); return types.SimpleNamespace(
-        id=1, chat=Chat(cid), link=f"https://t.me/c/{abs(cid) - 1000000000000}/1",
+async def cached(cid=None, fid=None, *a, **k):
+    cid = k.get("chat_id", cid); fid = k.get("file_id", fid)
+    calls.append(("cached", cid, fid)); mid = 2 if "CONTAINS" in fid else 1; return types.SimpleNamespace(
+        id=mid, chat=Chat(cid), link=f"https://t.me/c/{abs(cid) - 1000000000000}/{mid}",
         animation=Anim("DEST-" + fid, "DEST-UNIQUE"))
 async def animsend(cid, path, *a, **k):
     calls.append(("anim", cid, path)); return types.SimpleNamespace(
@@ -98,6 +99,15 @@ async def dl(msg, file_name, in_memory):
     p = os.path.join(os.path.dirname(file_name) or ".", "gif.mp4")
     open(p, "w").write("x")
     return p
+async def get_messages(chat_id, message_id):
+    if message_id == 1:
+        calls.append(("get_messages", chat_id, message_id))
+    link = f"https://saved.example/{chat_id}/{message_id}" if message_id == 1 else f"https://t.me/c/{abs(chat_id) - 1000000000000}/{message_id}"
+    return types.SimpleNamespace(link=link)
+
+async def send_document(chat_id, document, caption=None, **kwargs):
+    calls.append(("document", chat_id, document, caption))
+
 async def send_message(chat_id, text, reply_to_message_id=None, **kwargs):
     calls.append(("reply", chat_id, text, reply_to_message_id))
     reply = types.SimpleNamespace(id=700 + len([c for c in calls if c[0] == "reply"]), text=text, deleted=False)
@@ -109,6 +119,8 @@ async def send_message(chat_id, text, reply_to_message_id=None, **kwargs):
 client.send_cached_media = cached
 client.send_animation = animsend
 client.send_message = send_message
+setattr(client, "get_messages", get_messages)
+setattr(client, "send_document", send_document)
 client.download_media = dl
 
 # ── clone unprotected -> cached file_id ──
@@ -353,7 +365,8 @@ calls.clear()
 asyncio.run(bot.on_group_message(None, link_trigger))
 assert calls == [
     ("cached", -2001, "KW-LINK"),
-    ("reply", -1001, "https://t.me/c/-999999997999/1", 921),
+    ("get_messages", -2001, 1),
+    ("reply", -1001, "https://saved.example/-2001/1", 921),
 ], calls
 ok("exact keyword: sends destination post link as reply")
 
@@ -370,6 +383,22 @@ assert calls == [
 ], calls
 ok("contains keyword: sends destination post link as reply")
 
+# Reply mode can resend the cached destination GIF instead of linking it.
+bot.state["keyword_reply_resend"] = True
+bot.db.execute("DELETE FROM keyword_reply_cooldown")
+bot.db.commit()
+resend_trigger = Msg(gid=-1001, from_id=123, anim=False, mid=925)
+resend_trigger.text = "again"
+resend_trigger.reply_to_message = reply_source
+calls.clear()
+asyncio.run(bot.on_group_message(None, resend_trigger))
+assert calls == [
+    ("cached", -2001, "DEST-KW-LINK"),
+    ("cached", -1001, "DEST-KW-LINK"),
+], calls
+ok("keyword reply: resend mode sends destination GIF by file_id")
+bot.state["keyword_reply_resend"] = False
+
 second_link_trigger = Msg(gid=-1001, from_id=456, anim=False, mid=922)
 second_link_trigger.text = "again"
 second_link_trigger.reply_to_message = reply_source
@@ -379,7 +408,7 @@ assert calls == [("cached", -2001, "DEST-KW-LINK")], calls
 ok("exact keyword: link reply cooldown is shared across users")
 
 bot.state["keyword_antispam_enabled"] = True
-bot.state["keyword_reply_enabled"] = False
+bot.state["keyword_reply_enabled"] = False; bot.state["keyword_reply_contains_enabled"] = False
 contains_reply = Msg(gid=-1001, from_id=123, anim=False, mid=903)
 contains_reply.text = "please again now"
 contains_reply.reply_to_message = source
@@ -399,6 +428,7 @@ asyncio.run(bot.on_group_message(None, whitelist_bypass_reply))
 assert calls == [("cached", -2001, "DEST-KW-SOURCE")], calls
 ok("keyword anti-spam: whitelisted user bypasses cooldown when disabled")
 bot.state["keyword_antispam_whitelist"] = True
+bot.state["keyword_reply_enabled"] = False; bot.state["keyword_reply_contains_enabled"] = False
 
 other_source = Msg(gid=-1001, from_id=77, fid="KW-SOURCE-2", unique_id="KW-U-2", mid=904)
 contains_reply.reply_to_message = other_source

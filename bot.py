@@ -14,6 +14,7 @@ import os
 import sqlite3
 import tempfile
 import time
+import zipfile
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -62,15 +63,14 @@ DEFAULT_STATE = {
     "keyword_antispam_whitelist": True,
     "keyword_reply_enabled": False, "keyword_reply_contains_enabled": False, "keyword_reply_delete_seconds": 60.0,
     "keyword_reply_cooldown_seconds": 300.0, "keyword_reply_delay_seconds": 1.0,
+    "keyword_reply_resend": False,
 }
 
 
-def load_state() -> dict:
-    try:
-        with open(STATE_FILE, encoding="utf-8") as f:
-            state = json.load(f)
-    except FileNotFoundError:
-        return dict(DEFAULT_STATE)
+BACKUP_VERSION = 1
+
+
+def normalize_state(state: dict) -> dict:
     for key, default in DEFAULT_STATE.items():
         state.setdefault(key, default)
     state["groups"] = [int(g) for g in state["groups"]]
@@ -83,6 +83,7 @@ def load_state() -> dict:
     state["keyword_reply_delete_seconds"] = float(state["keyword_reply_delete_seconds"])
     state["keyword_reply_cooldown_seconds"] = float(state["keyword_reply_cooldown_seconds"])
     state["keyword_reply_delay_seconds"] = float(state["keyword_reply_delay_seconds"])
+    state["keyword_reply_resend"] = bool(state["keyword_reply_resend"])
     legacy_keywords = state.pop("keywords", [])
     state["keywords_exact"] = [str(k).casefold() for k in state["keywords_exact"] if str(k).strip()]
     state["keywords_contains"] = [str(k).casefold() for k in state["keywords_contains"] if str(k).strip()]
@@ -92,6 +93,15 @@ def load_state() -> dict:
             state["keywords_exact"].append(keyword)
     state["keyword_users"] = [int(u) for u in state["keyword_users"]]
     return state
+
+
+def load_state() -> dict:
+    try:
+        with open(STATE_FILE, encoding="utf-8") as f:
+            state = json.load(f)
+    except FileNotFoundError:
+        return dict(DEFAULT_STATE)
+    return normalize_state(state)
 
 
 def save_state(state: dict) -> None:
@@ -115,7 +125,7 @@ db = sqlite3.connect(str(SENT_DB))
 db.execute(
     "CREATE TABLE IF NOT EXISTS sent ("
     "file_unique_id TEXT, dest_file_id TEXT, dest_file_unique_id TEXT, "
-    "dest INTEGER NOT NULL, sent_at TEXT NOT NULL)"
+    "dest_message_id INTEGER, dest INTEGER NOT NULL, sent_at TEXT NOT NULL)"
 )
 # Migrate the old schema. Older versions had a NOT NULL `file_id` column,
 # which cannot accept the new INSERT shape. Those old file_id values were the
@@ -128,7 +138,7 @@ if "file_id" in columns:
     db.execute(
         "CREATE TABLE sent_new ("
         "file_unique_id TEXT, dest_file_id TEXT, dest_file_unique_id TEXT, "
-        "dest INTEGER NOT NULL, sent_at TEXT NOT NULL)"
+        "dest_message_id INTEGER, dest INTEGER NOT NULL, sent_at TEXT NOT NULL)"
     )
     db.execute("DROP TABLE sent")
     db.execute("ALTER TABLE sent_new RENAME TO sent")
@@ -139,6 +149,8 @@ if "dest_file_id" not in columns:
     db.execute("ALTER TABLE sent ADD COLUMN dest_file_id TEXT")
 if "dest_file_unique_id" not in columns:
     db.execute("ALTER TABLE sent ADD COLUMN dest_file_unique_id TEXT")
+if "dest_message_id" not in columns:
+    db.execute("ALTER TABLE sent ADD COLUMN dest_message_id INTEGER")
 db.execute("DROP INDEX IF EXISTS sent_ix")
 db.execute("DROP INDEX IF EXISTS sent_dest_unique_ix")
 db.execute("CREATE INDEX sent_ix ON sent (file_unique_id, dest)")
@@ -260,6 +272,14 @@ async def clone_media(message: Message, *, force: bool = False, return_message: 
         )
         try:
             sent_message = await send_with_flood_retry("send_cached_media", dest, cached[0])
+            if sent_message is not None:
+                dest_message_id = getattr(sent_message, "id", None)
+                db.execute(
+                    "UPDATE sent SET dest_message_id = ?, sent_at = datetime('now') "
+                    "WHERE rowid = (SELECT rowid FROM sent WHERE dest_file_id = ? AND dest = ? ORDER BY rowid DESC LIMIT 1)",
+                    (dest_message_id, cached[0], dest),
+                )
+                db.commit()
             return sent_message if return_message else sent_message is not None
         except errors.RPCError:
             log.warning(
@@ -322,9 +342,9 @@ async def clone_media(message: Message, *, force: bool = False, return_message: 
         return sent_message if return_message else True
 
     db.execute(
-        "INSERT INTO sent (file_unique_id, dest_file_id, dest_file_unique_id, dest, sent_at) "
-        "VALUES (?, ?, ?, ?, datetime('now'))",
-        (source_unique_id, dest_file_id, dest_unique_id, dest),
+        "INSERT INTO sent (file_unique_id, dest_file_id, dest_file_unique_id, dest_message_id, dest, sent_at) "
+        "VALUES (?, ?, ?, ?, ?, datetime('now'))",
+        (source_unique_id, dest_file_id, dest_unique_id, getattr(sent_message, "id", None), dest),
     )
     db.commit()
     log.info(
@@ -386,15 +406,22 @@ keyword_reply_worker_task: asyncio.Task | None = None
 
 
 async def _keyword_reply_worker(queue: asyncio.Queue) -> None:
-    """Send keyword link replies FIFO with a global anti-spam delay."""
+    """Send keyword replies FIFO with a global anti-spam delay."""
     while True:
-        message, link, result = await queue.get()
+        message, mode, value, result = await queue.get()
         try:
-            reply = await client.send_message(
-                chat_id=message.chat.id,
-                text=link,
-                reply_to_message_id=message.id,
-            )
+            if mode == "link":
+                reply = await client.send_message(
+                    chat_id=message.chat.id,
+                    text=value,
+                    reply_to_message_id=message.id,
+                )
+            else:
+                reply = await client.send_cached_media(
+                    chat_id=message.chat.id,
+                    file_id=value,
+                    reply_to_message_id=message.id,
+                )
             if not result.done():
                 result.set_result(reply)
             await asyncio.sleep(state["keyword_reply_delay_seconds"])
@@ -415,13 +442,31 @@ def _ensure_keyword_reply_worker() -> None:
         keyword_reply_worker_task = asyncio.create_task(_keyword_reply_worker(keyword_reply_queue))
 
 
-async def _queue_keyword_reply(message: Message, link: str):
+async def _queue_keyword_reply(message: Message, value: str, *, mode: str = "link"):
     _ensure_keyword_reply_worker()
     loop = asyncio.get_running_loop()
     result = loop.create_future()
     assert keyword_reply_queue is not None
-    await keyword_reply_queue.put((message, link, result))
+    await keyword_reply_queue.put((message, mode, value, result))
     return await result
+
+
+async def _saved_destination_link(file_unique_id: str, fallback=None) -> str | None:
+    row = db.execute(
+        "SELECT dest, dest_message_id FROM sent "
+        "WHERE file_unique_id = ? AND dest_message_id IS NOT NULL "
+        "ORDER BY rowid DESC LIMIT 1",
+        (file_unique_id,),
+    ).fetchone()
+    if row is not None:
+        try:
+            destination_message = await client.get_messages(row[0], row[1])
+            link = getattr(destination_message, "link", None)
+            if link:
+                return link
+        except Exception:
+            log.warning("could not fetch saved destination message %s/%s", row[0], row[1])
+    return getattr(fallback, "link", None)
 
 
 async def _delete_keyword_reply_later(reply: Message) -> None:
@@ -495,11 +540,23 @@ async def on_group_message(app, message, *a):
         log.info("keyword reply skipped for GIF unique_id=%s: cooldown %.1fs remaining", file_unique_id, remaining)
         return
     try:
-        link = getattr(result, "link", None)
-        if not link:
-            raise RuntimeError("Telegram returned no destination message link")
-        reply = await _queue_keyword_reply(message, link)
-        log.info("%s keyword link reply sent: GIF unique_id=%s -> %s", reply_mode, file_unique_id, link)
+        if state["keyword_reply_resend"]:
+            row = db.execute(
+                "SELECT dest_file_id FROM sent WHERE file_unique_id = ? AND dest_file_id IS NOT NULL "
+                "ORDER BY rowid DESC LIMIT 1",
+                (file_unique_id,),
+            ).fetchone()
+            reply_file_id = row[0] if row else getattr(getattr(result, "animation", None), "file_id", None)
+            if not reply_file_id:
+                raise RuntimeError("no destination file_id available for GIF reply")
+            reply = await _queue_keyword_reply(message, reply_file_id, mode="gif")
+            log.info("%s keyword GIF reply sent: GIF unique_id=%s via file_id=%s", reply_mode, file_unique_id, reply_file_id)
+        else:
+            link = await _saved_destination_link(file_unique_id, result)
+            if not link:
+                raise RuntimeError("no saved destination message link available")
+            reply = await _queue_keyword_reply(message, link, mode="link")
+            log.info("%s keyword link reply sent: GIF unique_id=%s -> %s", reply_mode, file_unique_id, link)
         if state["keyword_reply_delete_seconds"] > 0:
             asyncio.create_task(_delete_keyword_reply_later(reply))
     except Exception:
@@ -537,6 +594,9 @@ HELP_TEXT = (
     f"`{PREFIX}gc kw reply delete <0|s|m>` - set link reply delete delay\n"
     f"`{PREFIX}gc kw reply cooldown <s|m>` - set link reply cooldown\n"
     f"`{PREFIX}gc kw reply delay <s|m>` - set link reply queue delay\n"
+    f"`{PREFIX}gc kw reply resend on|off` - send GIF or destination link\n"
+    f"`{PREFIX}gc backup export` - export state and GIF cache\n"
+    f"`{PREFIX}gc backup import` - import a replied backup file\n"
     f"`{PREFIX}gc kw help` - show keyword help"
 )
 
@@ -712,6 +772,7 @@ async def cmd_status(args, message) -> str:
         f"- *Link reply delete delay:* `{state['keyword_reply_delete_seconds']}s`",
         f"- *Link reply cooldown:* `{state['keyword_reply_cooldown_seconds']}s`",
         f"- *Link reply queue delay:* `{state['keyword_reply_delay_seconds']}s`",
+        f"- *Keyword reply mode:* `{"resend GIF" if state['keyword_reply_resend'] else "destination link"}`",
     ]
     if state["dest"] is not None:
         try:
@@ -763,7 +824,8 @@ async def cmd_kw(args, message) -> str:
             f"- *Contains-keyword link replies:* `{'on' if state['keyword_reply_contains_enabled'] else 'off'}`\n"
             f"- *Link reply delete delay:* `{state['keyword_reply_delete_seconds']}s`\n"
             f"- *Link reply cooldown:* `{state['keyword_reply_cooldown_seconds']}s`\n"
-            f"- *Link reply queue delay:* `{state['keyword_reply_delay_seconds']}s`"
+            f"- *Link reply queue delay:* `{state['keyword_reply_delay_seconds']}s`\n"
+            f"- *Reply mode:* `{"resend GIF" if state['keyword_reply_resend'] else "destination link"}`"
         )
     sub = args[1].casefold()
     if sub == "help":
@@ -781,6 +843,7 @@ async def cmd_kw(args, message) -> str:
                 f"`{PREFIX}gc kw reply delete <0|s|m>`\n"
                 f"`{PREFIX}gc kw reply cooldown <s|m>`\n"
                 f"`{PREFIX}gc kw reply delay <s|m>`\n"
+                f"`{PREFIX}gc kw reply resend on|off`\n"
                 f"`{PREFIX}gc kw user add|remove|list <user_id>`")
 
     if sub == "reply":
@@ -789,12 +852,20 @@ async def cmd_kw(args, message) -> str:
                     f"contains-keyword link replies: {'on' if state['keyword_reply_contains_enabled'] else 'off'}\n"
                     f"delete delay: {state['keyword_reply_delete_seconds']}s\n"
                     f"cooldown: {state['keyword_reply_cooldown_seconds']}s\n"
-                    f"queue delay: {state['keyword_reply_delay_seconds']}s")
+                    f"queue delay: {state['keyword_reply_delay_seconds']}s\n"
+                    f"mode: {"resend GIF" if state["keyword_reply_resend"] else "destination link"}")
         action = args[2].casefold()
         if action in ("on", "off"):
             state["keyword_reply_enabled"] = action == "on"
             save_state(state)
             return f"exact-keyword link replies: {action}"
+        if action == "resend":
+            if len(args) < 4 or args[3].casefold() not in ("on", "off"):
+                return f"usage: `{PREFIX}gc kw reply resend <on|off>`"
+            value = args[3].casefold()
+            state["keyword_reply_resend"] = value == "on"
+            save_state(state)
+            return f"keyword reply resend GIF: {value}"
         if action == "contains":
             if len(args) < 4 or args[3].casefold() not in ("on", "off"):
                 return f"usage: `{PREFIX}gc kw reply contains <on|off>`"
@@ -807,7 +878,9 @@ async def cmd_kw(args, message) -> str:
                 return f"usage: `{PREFIX}gc kw reply {action} <0|s|m>`"
             raw = args[3].casefold()
             try:
-                if raw.endswith("s"):
+                if raw == "0":
+                    seconds = 0.0
+                elif raw.endswith("s"):
                     seconds = float(raw[:-1])
                 elif raw.endswith("m"):
                     seconds = float(raw[:-1]) * 60
@@ -933,6 +1006,99 @@ async def cmd_kw(args, message) -> str:
     return f"unknown kw subcommand; use `{PREFIX}gc kw help`"
 
 
+async def cmd_backup(args, message) -> str:
+    if len(args) < 2 or args[1].casefold() not in ("export", "import"):
+        return f"usage: `{PREFIX}gc backup export` or `{PREFIX}gc backup import`"
+    action = args[1].casefold()
+
+    if action == "export":
+        backup_path = DATA_DIR / f"gifcenter-backup-{int(time.time())}.zip"
+        sent_rows = [dict(zip(
+            ("file_unique_id", "dest_file_id", "dest_file_unique_id", "dest_message_id", "dest", "sent_at"), row
+        )) for row in db.execute(
+            "SELECT file_unique_id, dest_file_id, dest_file_unique_id, dest_message_id, dest, sent_at FROM sent"
+        )]
+        antispam_rows = [dict(zip(("file_unique_id", "expires_at"), row)) for row in db.execute(
+            "SELECT file_unique_id, expires_at FROM keyword_antispam"
+        )]
+        reply_rows = [dict(zip(("file_unique_id", "expires_at"), row)) for row in db.execute(
+            "SELECT file_unique_id, expires_at FROM keyword_reply_cooldown"
+        )]
+        payload = {
+            "version": BACKUP_VERSION,
+            "state": state,
+            "sent": sent_rows,
+            "keyword_antispam": antispam_rows,
+            "keyword_reply_cooldown": reply_rows,
+        }
+        try:
+            with zipfile.ZipFile(backup_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                zf.writestr("backup.json", json.dumps(payload, indent=2))
+            await client.send_document(message.chat.id, str(backup_path), caption="gifcenter backup")
+            return "backup exported"
+        except Exception as e:
+            return f"backup export failed: {type(e).__name__}: {e}"
+        finally:
+            backup_path.unlink(missing_ok=True)
+
+    source = getattr(message, "reply_to_message", None)
+    document = getattr(source, "document", None) if source else None
+    if document is None:
+        return f"reply to a gifcenter backup file with `{PREFIX}gc backup import`"
+
+    temp_path = DATA_DIR / f".gifcenter-import-{os.getpid()}-{int(time.time() * 1000)}.zip"
+    old_state = dict(state)
+    try:
+        await source.download(file_name=str(temp_path))
+        with zipfile.ZipFile(temp_path) as zf:
+            if "backup.json" not in zf.namelist():
+                raise ValueError("backup.json is missing")
+            payload = json.loads(zf.read("backup.json").decode("utf-8"))
+
+        if payload.get("version") != BACKUP_VERSION:
+            raise ValueError("unsupported backup version")
+        imported_state = payload.get("state")
+        if not isinstance(imported_state, dict):
+            raise ValueError("invalid state")
+        imported_state = normalize_state(imported_state)
+
+        sent_rows = payload.get("sent", [])
+        antispam_rows = payload.get("keyword_antispam", [])
+        reply_rows = payload.get("keyword_reply_cooldown", [])
+        if not all(isinstance(row, dict) for row in sent_rows + antispam_rows + reply_rows):
+            raise ValueError("invalid backup rows")
+
+        db.execute("BEGIN")
+        db.execute("DELETE FROM sent")
+        db.execute("DELETE FROM keyword_antispam")
+        db.execute("DELETE FROM keyword_reply_cooldown")
+        db.executemany(
+            "INSERT INTO sent (file_unique_id, dest_file_id, dest_file_unique_id, dest_message_id, dest, sent_at) VALUES (?, ?, ?, ?, ?, ?)",
+            [(r.get("file_unique_id"), r.get("dest_file_id"), r.get("dest_file_unique_id"),
+              r.get("dest_message_id"), r.get("dest"), r.get("sent_at")) for r in sent_rows],
+        )
+        db.executemany(
+            "INSERT INTO keyword_antispam (file_unique_id, expires_at) VALUES (?, ?)",
+            [(r.get("file_unique_id"), float(r.get("expires_at"))) for r in antispam_rows],
+        )
+        db.executemany(
+            "INSERT INTO keyword_reply_cooldown (file_unique_id, expires_at) VALUES (?, ?)",
+            [(r.get("file_unique_id"), float(r.get("expires_at"))) for r in reply_rows],
+        )
+        db.commit()
+
+        state.clear()
+        state.update(imported_state)
+        save_state(state)
+        return f"backup imported: {len(sent_rows)} cached GIF send(s)"
+    except Exception as e:
+        db.rollback()
+        state.clear()
+        state.update(old_state)
+        return f"backup import failed: {type(e).__name__}: {e}"
+    finally:
+        temp_path.unlink(missing_ok=True)
+
 async def cmd_session(args, message) -> str:
     try:
         s = await client.export_session_string()
@@ -969,6 +1135,8 @@ async def gc_command(app, message: Message, *a):
             text = await cmd_status(args, message)
         elif cmd == "kw":
             text = await cmd_kw(args, message)
+        elif cmd == "backup":
+            text = await cmd_backup(args, message)
         elif cmd == "session":
             text = await cmd_session(args, message)
         else:
