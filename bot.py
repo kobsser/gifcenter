@@ -21,7 +21,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from pyrogram import Client, enums, errors, filters
+from pyrogram import Client, enums, errors, filters, raw
 from pyrogram.types import Message
 
 # ─────────────────────────── config ───────────────────────────
@@ -550,6 +550,32 @@ async def _delete_keyword_reply_later(reply: Message) -> None:
 
 
 
+async def _edited_by_admin(message) -> int | None:
+    """Return the Telegram admin-log editor ID for a channel message edit."""
+    try:
+        peer = await client.resolve_peer(message.chat.id)
+        if not isinstance(peer, raw.types.InputPeerChannel):
+            return None
+        channel = raw.types.InputChannel(channel_id=peer.channel_id, access_hash=peer.access_hash)
+        events_filter = raw.types.ChannelAdminLogEventsFilter(edit=True)
+        for attempt in range(3):
+            result = await client.invoke(raw.functions.channels.GetAdminLog(
+                channel=channel, q="", max_id=0, min_id=0, limit=20, events_filter=events_filter
+            ))
+            for event in getattr(result, "events", []):
+                action = getattr(event, "action", None)
+                if not isinstance(action, raw.types.ChannelAdminLogEventActionEditMessage):
+                    continue
+                edited = getattr(action, "new_message", None)
+                if getattr(edited, "id", None) == message.id:
+                    return event.user_id
+            if attempt < 2:
+                await asyncio.sleep(0.15)
+    except Exception:
+        log.exception("failed to verify editor of destination message %s via admin log", message.id)
+    return None
+
+
 @client.on_edited_message()
 async def on_edited_message(app, message, *a):
     if state["dest"] is None or message.chat.id != state["dest"]:
@@ -557,8 +583,15 @@ async def on_edited_message(app, message, *a):
     caption = (getattr(message, "text", None) or getattr(message, "caption", None) or "").strip().casefold()
     if message.animation is None or caption != "ban":
         return
-    if not _is_admin(getattr(getattr(message, "from_user", None), "id", None)):
+
+    editor_id = await _edited_by_admin(message)
+    if editor_id is None:
+        log.warning("ignoring ban edit for destination message %s: editor could not be verified", message.id)
         return
+    if not _is_admin(editor_id):
+        log.info("ignoring ban edit for destination message %s by unauthorized user %s", message.id, editor_id)
+        return
+    log.info("verified ban edit for destination message %s by admin %s", message.id, editor_id)
 
     dest_uid = message.animation.file_unique_id
     rows = db.execute(
