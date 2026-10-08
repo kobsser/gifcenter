@@ -495,6 +495,31 @@ async def _destination_message_link(dest: int, message_id: int) -> str | None:
     return None
 
 
+async def _backfill_destination_message_id(dest: int, rowid: int, dest_unique_id: str | None) -> int | None:
+    """Find an existing destination GIF message and persist its message ID.
+
+    Older DB rows can predate destination message IDs. Link mode must not resend
+    those GIFs, so recover the ID by scanning the destination history once.
+    """
+    if dest is None or not dest_unique_id:
+        return None
+    try:
+        async for candidate in client.get_chat_history(dest, limit=500):
+            animation = getattr(candidate, "animation", None)
+            if getattr(animation, "file_unique_id", None) != dest_unique_id:
+                continue
+            message_id = getattr(candidate, "id", None)
+            if message_id is None:
+                continue
+            db.execute("UPDATE sent SET dest_message_id = ? WHERE rowid = ?", (message_id, rowid))
+            db.commit()
+            log.info("keyword link lookup: backfilled destination message ID %s/%s", dest, message_id)
+            return message_id
+    except Exception:
+        log.exception("keyword link lookup: failed to scan destination history for file_unique_id=%s", dest_unique_id)
+    return None
+
+
 async def _saved_destination_link(file_unique_id: str, fallback=None) -> str | None:
     """Return the existing destination message link without sending anything.
 
@@ -505,9 +530,9 @@ async def _saved_destination_link(file_unique_id: str, fallback=None) -> str | N
     dest = state.get("dest")
     if dest is not None:
         row = db.execute(
-            "SELECT dest, dest_message_id, file_unique_id, dest_file_unique_id "
+            "SELECT rowid, dest, dest_message_id, file_unique_id, dest_file_unique_id "
             "FROM sent "
-            "WHERE dest = ? AND dest_message_id IS NOT NULL "
+            "WHERE dest = ? "
             "AND (file_unique_id = ? OR dest_file_unique_id = ?) "
             "ORDER BY rowid DESC LIMIT 1",
             (dest, file_unique_id, file_unique_id),
@@ -517,16 +542,17 @@ async def _saved_destination_link(file_unique_id: str, fallback=None) -> str | N
 
     if row is None:
         row = db.execute(
-            "SELECT dest, dest_message_id, file_unique_id, dest_file_unique_id "
+            "SELECT rowid, dest, dest_message_id, file_unique_id, dest_file_unique_id "
             "FROM sent "
-            "WHERE dest_message_id IS NOT NULL "
             "AND (file_unique_id = ? OR dest_file_unique_id = ?) "
             "ORDER BY rowid DESC LIMIT 1",
             (file_unique_id, file_unique_id),
         ).fetchone()
 
     if row is not None:
-        saved_dest, message_id, source_uid, dest_uid = row
+        rowid, saved_dest, message_id, source_uid, dest_uid = row
+        if message_id is None:
+            message_id = await _backfill_destination_message_id(saved_dest, rowid, dest_uid)
         if state["keyword_reply_message_check"] == "db":
             link = await _destination_message_link(saved_dest, message_id)
             if link:
