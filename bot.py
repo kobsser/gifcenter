@@ -495,38 +495,8 @@ async def _destination_message_link(dest: int, message_id: int) -> str | None:
     return None
 
 
-async def _backfill_destination_message_id(dest: int, rowid: int, dest_unique_id: str | None) -> int | None:
-    """Find an existing destination GIF message and persist its message ID.
-
-    Older DB rows can predate destination message IDs. Link mode must not resend
-    those GIFs, so recover the ID by scanning the destination history once.
-    """
-    if dest is None or not dest_unique_id:
-        return None
-    try:
-        async for candidate in client.get_chat_history(dest, limit=500):
-            animation = getattr(candidate, "animation", None)
-            if getattr(animation, "file_unique_id", None) != dest_unique_id:
-                continue
-            message_id = getattr(candidate, "id", None)
-            if message_id is None:
-                continue
-            db.execute("UPDATE sent SET dest_message_id = ? WHERE rowid = ?", (message_id, rowid))
-            db.commit()
-            log.info("keyword link lookup: backfilled destination message ID %s/%s", dest, message_id)
-            return message_id
-    except Exception:
-        log.exception("keyword link lookup: failed to scan destination history for file_unique_id=%s", dest_unique_id)
-    return None
-
-
 async def _saved_destination_link(file_unique_id: str, fallback=None) -> str | None:
-    """Return the existing destination message link without sending anything.
-
-    Link mode must never resend the GIF. Search both the source and destination
-    unique IDs because deduplication accepts either identity. Prefer the
-    configured destination chat and the newest row with a saved message ID.
-    """
+    """Return the saved destination message link without inspecting history."""
     dest = state.get("dest")
     if dest is not None:
         row = db.execute(
@@ -544,15 +514,13 @@ async def _saved_destination_link(file_unique_id: str, fallback=None) -> str | N
         row = db.execute(
             "SELECT rowid, dest, dest_message_id, file_unique_id, dest_file_unique_id "
             "FROM sent "
-            "AND (file_unique_id = ? OR dest_file_unique_id = ?) "
+            "WHERE file_unique_id = ? OR dest_file_unique_id = ? "
             "ORDER BY rowid DESC LIMIT 1",
             (file_unique_id, file_unique_id),
         ).fetchone()
 
     if row is not None:
         rowid, saved_dest, message_id, source_uid, dest_uid = row
-        if message_id is None:
-            message_id = await _backfill_destination_message_id(saved_dest, rowid, dest_uid)
         if state["keyword_reply_message_check"] == "db":
             link = await _destination_message_link(saved_dest, message_id)
             if link:
@@ -762,8 +730,30 @@ async def on_group_message(app, message, *a):
             log.info("%s keyword GIF reply sent: GIF unique_id=%s via file_id=%s", reply_mode, file_unique_id, reply_file_id)
         else:
             link = await _saved_destination_link(file_unique_id, result)
-            if not link:
-                raise RuntimeError("no saved destination message link available")
+            if link:
+                log.info(
+                    "%s keyword link reply: using saved destination message for GIF unique_id=%s -> %s",
+                    reply_mode, file_unique_id, link,
+                )
+            else:
+                # Link mode normally reuses the already-sent destination message.
+                # If its message ID is unavailable (or the saved message cannot be
+                # resolved), do not inspect destination history: resend the GIF as
+                # the explicit last-resort fallback and link the new message.
+                fallback_result = await _queue_send(
+                    replied,
+                    force=True,
+                    return_message=True,
+                )
+                fallback_id = getattr(fallback_result, "id", None)
+                fallback_dest = state.get("dest")
+                link = await _destination_message_link(fallback_dest, fallback_id)
+                if not link:
+                    raise RuntimeError("could not build destination message link after fallback resend")
+                log.info(
+                    "%s keyword link reply: saved link unavailable; resent GIF and using new destination message %s/%s -> %s",
+                    reply_mode, file_unique_id, fallback_dest, fallback_id, link,
+                )
             reply = await _queue_keyword_reply(message, link, mode="link")
             log.info("%s keyword link reply sent: GIF unique_id=%s -> %s", reply_mode, file_unique_id, link)
         if state["keyword_reply_delete_seconds"] > 0:
