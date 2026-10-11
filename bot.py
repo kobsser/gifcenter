@@ -1410,9 +1410,7 @@ async def gc_handler(app, message, *a):
 
 def _parse_chat_id(token: str):
     token = token.strip()
-    if token.isdigit():
-        return int(token)
-    if token.startswith("-100") and token[4:].isdigit():
+    if token.lstrip("-").isdigit():
         return int(token)
     if token.startswith("@") and token[1:].isalnum() and len(token) >= 5:
         return token
