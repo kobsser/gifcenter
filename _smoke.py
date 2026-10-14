@@ -492,6 +492,26 @@ asyncio.run(bot.on_group_message(None, blocked))
 assert calls == [("cached", -2001, "KW-ALL")], calls
 ok("keyword reply: everyone toggle allows all users")
 
+# Anonymous admins have sender_chat but no from_user. They work with open
+# keyword access, while whitelist-only mode continues to deny unknown IDs.
+anonymous = Msg(gid=-1001, from_id=0, anim=False, mid=930)
+anonymous.from_user = None
+anonymous.sender_chat = Chat(-1001, "supergroup", "Test group")
+anonymous.text = "again"
+anonymous.reply_to_message = Msg(gid=-1001, from_id=77, fid="KW-ANON", unique_id="KW-ANON-U", mid=929)
+bot.state["keyword_allow_all"] = True
+calls.clear()
+asyncio.run(bot.on_group_message(None, anonymous))
+assert calls == [("cached", -2001, "KW-ANON")], calls
+ok("anonymous admin keyword reply works when everyone is allowed")
+
+bot.state["keyword_allow_all"] = False
+calls.clear()
+asyncio.run(bot.on_group_message(None, anonymous))
+assert calls == [], calls
+ok("anonymous admin remains blocked in whitelist-only mode")
+bot.state["keyword_allow_all"] = True
+
 # Same GIF cooldown is independent of user/chat/message and expires normally.
 bot.state["keyword_antispam_seconds"] = 1.0
 source2 = Msg(gid=-1001, from_id=77, fid="KW-TEMP", unique_id="KW-TEMP-U", mid=905)

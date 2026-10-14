@@ -656,7 +656,13 @@ async def on_edited_message(app, message, *a):
 async def on_group_message(app, message, *a):
     if message.chat.id not in state["groups"]:
         return
-    if not message.from_user or message.from_user.is_self:
+    # Anonymous group admins are represented by sender_chat and may have no
+    # from_user. Allow them through when keyword access is open; the existing
+    # whitelist check below still requires an identifiable, whitelisted user.
+    sender_chat = getattr(message, "sender_chat", None)
+    if message.from_user is not None and message.from_user.is_self:
+        return
+    if message.from_user is None and sender_chat is None:
         return
     if message.animation is not None:
         log.info("GIF in watched group %s (msg %d) — cloning", message.chat.id, message.id)
@@ -670,8 +676,11 @@ async def on_group_message(app, message, *a):
     keyword = exact or contains
     if keyword is None:
         return
-    if not state["keyword_allow_all"] and message.from_user.id not in state["keyword_users"]:
-        log.info("keyword %r ignored for user %s: not whitelisted", keyword, message.from_user.id)
+    if not state["keyword_allow_all"] and (
+        message.from_user is None or message.from_user.id not in state["keyword_users"]
+    ):
+        sender_id = message.from_user.id if message.from_user is not None else None
+        log.info("keyword %r ignored for user %s: not whitelisted", keyword, sender_id)
         return
     replied = getattr(message, "reply_to_message", None)
     if replied is None or replied.animation is None:
@@ -680,7 +689,9 @@ async def on_group_message(app, message, *a):
     if is_blacklisted(file_unique_id):
         log.info("keyword %r ignored: GIF unique_id=%s is blacklisted", keyword, file_unique_id)
         return
-    is_whitelisted = message.from_user.id in state["keyword_users"]
+    is_whitelisted = (
+        message.from_user is not None and message.from_user.id in state["keyword_users"]
+    )
     if is_whitelisted and not state["keyword_antispam_whitelist"]:
         log.info("keyword %r accepted for whitelisted user %s: anti-spam bypassed for GIF unique_id=%s", keyword, message.from_user.id, file_unique_id)
     else:
@@ -688,7 +699,8 @@ async def on_group_message(app, message, *a):
         if not reserved:
             log.info("keyword %r ignored: GIF unique_id=%s is on anti-spam cooldown for %.1fs", keyword, file_unique_id, remaining)
             return
-        log.info("keyword %r accepted for GIF unique_id=%s by user %s; cooldown=%ss", keyword, file_unique_id, message.from_user.id, state["keyword_antispam_seconds"])
+        sender_id = message.from_user.id if message.from_user is not None else f"anonymous chat {sender_chat.id}"
+        log.info("keyword %r accepted for GIF unique_id=%s by user %s; cooldown=%ss", keyword, file_unique_id, sender_id, state["keyword_antispam_seconds"])
     reply_mode = "exact" if exact is not None else "contains"
     reply_enabled = (
         state["keyword_reply_enabled"] if reply_mode == "exact"
