@@ -85,6 +85,8 @@ me = U(5, self_=True)
 client.me = me
 
 calls = []
+reply_parse_modes = []
+reply_web_previews = []
 async def cached(cid=None, fid=None, *a, **k):
     cid = k.get("chat_id", cid); fid = k.get("file_id", fid)
     calls.append(("cached", cid, fid)); mid = 2 if "CONTAINS" in fid else 1; return types.SimpleNamespace(
@@ -109,6 +111,8 @@ async def send_document(chat_id, document, caption=None, **kwargs):
     calls.append(("document", chat_id, document, caption))
 
 async def send_message(chat_id, text, reply_to_message_id=None, **kwargs):
+    reply_parse_modes.append(kwargs.get("parse_mode"))
+    reply_web_previews.append(kwargs.get("disable_web_page_preview"))
     calls.append(("reply", chat_id, text, reply_to_message_id))
     reply = types.SimpleNamespace(id=700 + len([c for c in calls if c[0] == "reply"]), text=text, deleted=False)
     async def delete():
@@ -365,7 +369,7 @@ calls.clear()
 asyncio.run(bot.on_group_message(None, link_trigger))
 assert calls == [
     ("cached", -2001, "KW-LINK"),
-    ("reply", -1001, "https://t.me/gifcenter_test/1", 921),
+    ("reply", -1001, "*https://t.me/gifcenter_test/1*", 921),
 ], calls
 ok("exact keyword: sends destination post link as reply")
 
@@ -379,7 +383,7 @@ existing_link_trigger.reply_to_message = reply_source
 calls.clear()
 asyncio.run(bot.on_group_message(None, existing_link_trigger))
 assert calls == [
-    ("reply", -1001, "https://t.me/gifcenter_test/1", 926),
+    ("reply", -1001, "*https://t.me/gifcenter_test/1*", 926),
 ], calls
 ok("keyword link: dedup hit uses saved destination message without resend")
 
@@ -398,7 +402,7 @@ dest_uid_trigger.reply_to_message = dest_uid_source
 calls.clear()
 asyncio.run(bot.on_group_message(None, dest_uid_trigger))
 assert calls == [
-    ("reply", -1001, "https://t.me/gifcenter_test/44", 928),
+    ("reply", -1001, "*https://t.me/gifcenter_test/44*", 928),
 ], calls
 ok("keyword link: destination file_unique_id lookup works without resend")
 
@@ -411,9 +415,11 @@ calls.clear()
 asyncio.run(bot.on_group_message(None, contains_link_trigger))
 assert calls == [
     ("cached", -2001, "KW-CONTAINS-LINK"),
-    ("reply", -1001, "https://t.me/gifcenter_test/2", 923),
+    ("reply", -1001, "*https://t.me/gifcenter_test/2*", 923),
 ], calls
-ok("contains keyword: sends destination post link as reply")
+assert reply_parse_modes[-1] == enums.ParseMode.MARKDOWN, reply_parse_modes
+assert reply_web_previews[-1] is True, reply_web_previews
+ok("contains keyword: sends bold destination link with Markdown parsing and preview disabled")
 
 # Reply mode can resend the cached destination GIF instead of linking it.
 bot.db.execute("DELETE FROM keyword_reply_cooldown")
