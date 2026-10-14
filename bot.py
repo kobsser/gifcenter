@@ -444,7 +444,7 @@ async def _keyword_reply_worker(queue: asyncio.Queue) -> None:
             if mode == "link":
                 reply = await client.send_message(
                     chat_id=message.chat.id,
-                    text=f"*{value}*",
+                    text=f"**{value}**",
                     reply_to_message_id=message.id,
                     parse_mode=enums.ParseMode.MARKDOWN,
                     disable_web_page_preview=True,

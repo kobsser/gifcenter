@@ -369,7 +369,7 @@ calls.clear()
 asyncio.run(bot.on_group_message(None, link_trigger))
 assert calls == [
     ("cached", -2001, "KW-LINK"),
-    ("reply", -1001, "*https://t.me/gifcenter_test/1*", 921),
+    ("reply", -1001, "**https://t.me/gifcenter_test/1**", 921),
 ], calls
 ok("exact keyword: sends destination post link as reply")
 
@@ -383,7 +383,7 @@ existing_link_trigger.reply_to_message = reply_source
 calls.clear()
 asyncio.run(bot.on_group_message(None, existing_link_trigger))
 assert calls == [
-    ("reply", -1001, "*https://t.me/gifcenter_test/1*", 926),
+    ("reply", -1001, "**https://t.me/gifcenter_test/1**", 926),
 ], calls
 ok("keyword link: dedup hit uses saved destination message without resend")
 
@@ -402,7 +402,7 @@ dest_uid_trigger.reply_to_message = dest_uid_source
 calls.clear()
 asyncio.run(bot.on_group_message(None, dest_uid_trigger))
 assert calls == [
-    ("reply", -1001, "*https://t.me/gifcenter_test/44*", 928),
+    ("reply", -1001, "**https://t.me/gifcenter_test/44**", 928),
 ], calls
 ok("keyword link: destination file_unique_id lookup works without resend")
 
@@ -415,7 +415,7 @@ calls.clear()
 asyncio.run(bot.on_group_message(None, contains_link_trigger))
 assert calls == [
     ("cached", -2001, "KW-CONTAINS-LINK"),
-    ("reply", -1001, "*https://t.me/gifcenter_test/2*", 923),
+    ("reply", -1001, "**https://t.me/gifcenter_test/2**", 923),
 ], calls
 assert reply_parse_modes[-1] == enums.ParseMode.MARKDOWN, reply_parse_modes
 assert reply_web_previews[-1] is True, reply_web_previews
